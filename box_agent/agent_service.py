@@ -8,7 +8,7 @@ from typing import Any
 from .agent import Agent
 from .agent_runtime import AgentFactory, build_agent
 from .agent_run import AgentRunHandle
-from .api import RunRequest
+from .api import RunDeliveryOptions, RunRequest
 from .run_control import PermissionBroker, RunControl
 
 
@@ -48,6 +48,7 @@ class AgentService:
         *,
         session: Any,
         options: Any | None = None,
+        delivery_options: RunDeliveryOptions | None = None,
     ) -> AgentRunHandle:
         """Start one protocol-neutral run over an existing AgentSession.
 
@@ -86,6 +87,7 @@ class AgentService:
             )
 
         handle = AgentRunHandle.for_run(
+            delivery_options=delivery_options,
             state=session,
             run_id=request.run_id,
             events_factory=lambda: session.run_events(options=options),
