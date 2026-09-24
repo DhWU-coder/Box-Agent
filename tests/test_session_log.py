@@ -195,7 +195,7 @@ def test_session_log_accepts_only_equivalent_cwd_syntax(tmp_path):
     log.close()
 
     restored = SessionLog.open(root, session_id="normalized-cwd", cwd=workspace)
-    assert restored.header["cwd"] == os.path.abspath(os.fspath(workspace))
+    assert restored.header["cwd"] == os.path.normcase(os.path.abspath(workspace))
     restored.close()
 
 

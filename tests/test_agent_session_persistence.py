@@ -1014,8 +1014,9 @@ async def test_agent_restore_uses_current_skill_and_reports_known_changes_withou
     assert restored.skill_runtime.state.sequence == before_sequence
     restored.add_user_message("continue review")
     await restored.run()
-    reference = str(llm.requests[0][-1].content)
-    assert current.to_prompt() in reference.replace("\\n", "\n")
+    content = llm.requests[0][-1].content
+    reference = "\n".join(block["text"] for block in content if block["type"] == "text")
+    assert current.to_prompt() in reference
     assert current.to_prompt() not in llm.requests[0][0].content
     if change == "hash" or not legacy_record:
         assert original_records[0]["sha256"] in reference

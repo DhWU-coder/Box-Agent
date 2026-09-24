@@ -5296,7 +5296,7 @@ def test_artifact_detect_in_nested_task_dir(tmp_path):
     assert a.mime == "image/png"
     assert a.size == 4
     assert a.rel_path == "output/chart.png"
-    assert a.abs_path.endswith("output/chart.png")
+    assert Path(a.abs_path) == out / "chart.png"
     assert a.uri.startswith("file://")
     assert a.sha256 != ""
     assert a.produced_at != ""
@@ -6054,7 +6054,7 @@ def test_artifact_envelope_shape(tmp_path):
     assert env["kind"] == "spreadsheet"
     assert env["filename"] == "report.xlsx"
     assert env["rel_path"] == "reports/report.xlsx"
-    assert env["abs_path"].endswith("reports/report.xlsx")
+    assert Path(env["abs_path"]) == f
     assert env["uri"].startswith("file://")
     assert env["size"] == 4
     assert env["sha256"]
