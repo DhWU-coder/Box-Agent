@@ -434,7 +434,7 @@ async def test_nested_tool_calls_do_not_consume_parent_tool_budget(
 
 
 @pytest.mark.asyncio
-async def test_delegated_tool_budget_blocks_only_new_subagents(tmp_path) -> None:
+async def test_hard_delegated_budget_rejects_unintegrated_subagents(tmp_path) -> None:
     messages = _msgs()
     llm = MockLLM(
         [
@@ -481,7 +481,7 @@ async def test_delegated_tool_budget_blocks_only_new_subagents(tmp_path) -> None
         )
     )
 
-    assert nested_tool.calls == 1
+    assert nested_tool.calls == 0
     blocked = next(
         event
         for event in events
@@ -489,12 +489,7 @@ async def test_delegated_tool_budget_blocks_only_new_subagents(tmp_path) -> None
         and event.tool_call_id == "delegated-blocked"
     )
     assert blocked.success is False
-    assert "Delegated tool call budget reached" in (blocked.error or "")
-    assert any(
-        isinstance(event, InjectedMessageEvent)
-        and "子 Agent 内部工具预算已达到上限" in event.content
-        for event in events
-    )
+    assert "DELEGATED_BUDGET_UNSUPPORTED" in (blocked.error or "")
 
 
 

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from .delegated_budget import BudgetCharge, DelegatedBudget
 
 from .schema_validation import (
     ToolArgumentIssue,
@@ -45,6 +47,8 @@ class ToolInvocationContext:
     event_queue: asyncio.Queue | None = None
     parent_tool_call_id: str = ""
     skill_reader: Callable[..., ToolResult] | None = None
+    child_budgets: tuple[DelegatedBudget, ...] = ()
+    budget_charge: BudgetCharge = field(default_factory=BudgetCharge)
 
 
 class Tool:
