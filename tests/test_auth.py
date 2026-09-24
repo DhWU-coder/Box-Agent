@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import stat
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -171,7 +173,13 @@ async def test_refresh_hosted_auth_token_rotates_and_atomically_persists(
         "refresh_token": "refresh-two",
         "office_identity": "employee",
     }
-    assert auth_file.stat().st_mode & 0o777 == 0o600
+    mode = auth_file.stat().st_mode
+    if os.name == "nt":
+        # Windows chmod controls the read-only attribute, not POSIX ACL bits.
+        assert mode & (stat.S_IREAD | stat.S_IWRITE) == stat.S_IREAD | stat.S_IWRITE
+    else:
+        assert stat.S_IMODE(mode) == 0o600
+    assert not list(tmp_path.glob(".auth.json.*.tmp"))
 
 
 @pytest.mark.asyncio
