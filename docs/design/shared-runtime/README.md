@@ -13,7 +13,7 @@
 | T5 委派共享硬预算 | 执行预算行为 | [T5](T5.md) |
 | T6 桌面适配回归 | 集成验证 | [T6](T6.md) |
 
-提交前检查目标 diff、暂存 diff 和工作区，使用明确路径暂存。运行时交付止于源码、测试和可构建包；不推送、不安装、不重启产品。
+提交前检查目标 diff、暂存 diff 和工作区，使用明确路径暂存。最初交付止于源码、测试和可构建包；后续按用户授权增加开发版启动、重启与联调。不推送、不替换正式安装版。
 
 ## 评审入口
 
@@ -26,10 +26,18 @@
 | T3 | e524c97 | agent_run、run_control |
 | T4 | cc8df2d | api/delivery、run_events、agent_service、sdk |
 | T5 | a6b3320 | tools/delegated_budget、tools/engine、sub_agent_tool |
-| T6 | 本记录所在提交 | ACP/Session 取消接点、共享权限等待、SDK 仅结果入口、集成回归 |
+| T6 | f4f03e8 | ACP/Session 取消接点、共享权限等待、SDK 仅结果入口、集成回归 |
 
-T1–T5 已完成实现和直接验收。T6 已实施桌面适配及验证，**全量门禁未通过**，不能视为发布验收完成。源码包构建与实际产品安装是独立边界。
+T1–T6 已完成实现和直接验收。T6 当时的全量失败保留在历史记录中；后续经 T9 收敛，最终 Windows 全量门禁为 **5713 passed、318 skipped、1 deselected、0 failed**，编译和 wheel/sdist 构建通过。源码包构建与实际产品安装是独立边界。
 
 后续修复：[T7 Windows 路径测试兼容](T7-windows-tests.md)，记录本轮路径误失败的修复及剩余非路径失败。
 
 [T8 平台权限与符号链接能力](T8-platform-test-capabilities.md)：修复权限属性误断言，按实际能力执行符号链接验证。
+
+## 后续验收与兼容审查
+
+- [T9 完整测试门禁](T9-test-gate.md)，提交 `ad143b0`：记录 Windows 测试兼容、用户状态隔离、全部失败/跳过原因和最终构建证据。期间发现的产品缺陷分别由 T9a–T9e 独立方案与提交处理。
+- [T10 桌面场景联调](T10-desktop-scenarios.md)，提交 `264a528`：真实开发客户端 IPC/ACP 八场景及六个自动 stdio 回归通过。测试启动配置引发的 `connectors:get-states` 错误已修复，普通开发实例已恢复并重启到最终源码。
+- [T11 兼容审查](T11-compatibility-review.md)：前端无需为本轮新增 ACP 字段；SDK 消费模式、严格序列化调用方和自定义委派工具的迁移条件分别列出。前端自身旧测试失败没有计入 Box-Agent 的通过结果。
+
+当前达到源码、测试、Python 分发包、开发客户端重启/健康探针与确定性场景验证。尚未构建/安装本次 standalone runtime 或正式桌面包，也未在正式包上完成新真实用户任务；下一发布环节沿用原打包流程，必须更新实际携带的 runtime。
