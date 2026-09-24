@@ -73,6 +73,39 @@ class PermissionBroker:
         self._pending: dict[str, tuple[dict[str, object], asyncio.Future[str | None]]] = {}
         self._cancelled = False
         self._grant_store = grant_store
+        self._result_only = False
+        self._fallback_tasks: dict[str, asyncio.Task] = {}
+
+    def use_result_only(self) -> None:
+        """Route pending and future permissions to an awaited host callback."""
+        self._result_only = True
+        for request_id, (request, future) in self._pending.items():
+            if not future.done():
+                self._start_fallback(request_id, request, future)
+
+    def _start_fallback(self, request_id, request, future) -> asyncio.Task:
+        if request_id not in self._fallback_tasks:
+            self._fallback_tasks[request_id] = asyncio.create_task(
+                self._notify_fallback(request, future),
+            )
+        return self._fallback_tasks[request_id]
+
+    async def _notify_fallback(self, request, future) -> None:
+        try:
+            notification = self._on_request(request)
+            if notification is not None:
+                await notification
+        finally:
+            # A callback that cannot answer must not leave an invisible prompt.
+            if not future.done():
+                future.set_result(None)
+
+    async def aclose(self) -> None:
+        self.cancel()
+        tasks = tuple(self._fallback_tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._fallback_tasks.clear()
 
     def bind_run(self, *, run_id: str, grant_store: GrantStore | None) -> None:
         """Bind once to the owning run and its existing permission store."""
@@ -103,7 +136,9 @@ class PermissionBroker:
         }
         self._pending[request_id] = (request, future)
         try:
-            if self._event_sink is not None:
+            if self._result_only:
+                notification = self._start_fallback(request_id, request, future)
+            elif self._event_sink is not None:
                 notification = self._event_sink(PermissionRequestEvent(
                     tool_call_id=str(request.get("tool_call_id") or ""),
                     scope=str(request.get("scope") or ""),
@@ -132,6 +167,11 @@ class PermissionBroker:
             raise
         finally:
             self._pending.pop(request_id, None)
+            task = self._fallback_tasks.pop(request_id, None)
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def respond(self, command: ControlCommand) -> bool:
         """Apply one permission command; return false for stale/unknown IDs."""
@@ -172,6 +212,9 @@ class PermissionBroker:
 
     def cancel(self) -> None:
         self._cancelled = True
+        for task in self._fallback_tasks.values():
+            if not task.done():
+                task.cancel()
         for _request, future in self._pending.values():
             if not future.done():
                 future.set_result(None)

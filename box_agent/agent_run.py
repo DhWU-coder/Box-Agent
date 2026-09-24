@@ -47,6 +47,8 @@ class AgentRunHandle:
         default=None, init=False, repr=False,
     )
     _events_consumed: bool = field(default=False, init=False, repr=False)
+    _result_only: bool = field(default=False, init=False, repr=False)
+    _drain_task: asyncio.Task | None = field(default=None, init=False, repr=False)
     _runner_error: BaseException | None = field(default=None, init=False, repr=False)
     @classmethod
     def for_run(
@@ -235,6 +237,8 @@ class AgentRunHandle:
         """Yield ordered event envelopes for this run."""
 
         self._start()
+        if self._result_only:
+            raise RuntimeError("run uses result-only consumption; events are unavailable")
         if self._events_consumed:
             raise RuntimeError("run events already have a consumer")
         self._events_consumed = True
@@ -315,11 +319,24 @@ class AgentRunHandle:
         await self.send(ControlCommand.cancel())
 
     async def result(self) -> RunResult:
-        """Wait for and return the single terminal result."""
+        """Wait for the result; without a stream consumer, consume privately.
+
+        Start iterating events first when the caller needs the event stream.
+        Cancelling this waiter never cancels the run or its private consumer.
+        """
 
         self._start()
+        if not self._events_consumed and not self._result_only:
+            self._result_only = True
+            if self._permission_broker is not None:
+                self._permission_broker.use_result_only()
+            self._drain_task = asyncio.create_task(self._drain_events())
         assert self._result_future is not None
         return await asyncio.shield(self._result_future)
+
+    async def _drain_events(self) -> None:
+        while await self._channel.get() is not self._channel.END:
+            pass
 
     async def aclose(self) -> None:
         """Settle the runner and its resources when a host abandons the run."""
@@ -339,6 +356,10 @@ class AgentRunHandle:
             )
             self._result_future.set_result(self._collector.result)
             self._channel.close()
+        if self._drain_task is not None:
+            await asyncio.gather(self._drain_task, return_exceptions=True)
+        if self._permission_broker is not None:
+            await self._permission_broker.aclose()
 
     async def __aenter__(self) -> "AgentRunHandle":
         self._start()

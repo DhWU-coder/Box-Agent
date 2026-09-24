@@ -69,3 +69,72 @@ def test_result_classifies_termination_without_changing_legacy_status(reason, ki
     assert result.stop_reason == reason
     assert result.termination_kind == kind
     assert json.loads(json.dumps(result.to_dict()))["termination_kind"] == kind
+
+
+@pytest.mark.asyncio
+async def test_result_only_drains_large_stream_and_rejects_late_subscription():
+    async def events():
+        for _ in range(5000):
+            yield ContentEvent("piece")
+        yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="finished")
+
+    handle = AgentRunHandle.for_run(state=SimpleNamespace(), run_id="r", events_factory=events)
+    first, second = await asyncio.gather(handle.result(), handle.result())
+    assert first is second
+    assert first.final_content == "finished"
+    with pytest.raises(RuntimeError, match="result-only"):
+        await anext(handle.events())
+    await handle.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_result_waiter_keeps_run_and_private_consumer_alive():
+    gate = asyncio.Event()
+
+    async def events():
+        await gate.wait()
+        yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="finished")
+
+    handle = AgentRunHandle.for_run(state=SimpleNamespace(), run_id="r", events_factory=events)
+    waiter = asyncio.create_task(handle.result())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    gate.set()
+    assert (await handle.result()).final_content == "finished"
+    await handle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approve", [True, False])
+@pytest.mark.parametrize("pending", [True, False])
+async def test_result_only_routes_existing_and_future_permissions(approve, pending):
+    from box_agent.api import ControlCommand
+    from box_agent.run_control import PermissionBroker
+
+    async def callback(request):
+        if approve:
+            await broker.respond(ControlCommand.permission_response(request["request_id"], approved=True))
+
+    broker = PermissionBroker(run_id="r", on_request=callback)
+    notified = asyncio.Event()
+    broker.set_event_sink(lambda event: notified.set())
+    if not pending:
+        broker.use_result_only()
+    task = asyncio.create_task(broker.negotiate({"scope": "safety", "request_id": "p"}))
+    if pending:
+        await notified.wait()
+        broker.use_result_only()
+    assert await asyncio.wait_for(task, 1) is approve
+    await broker.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_wakes_empty_channel_consumer_without_queued_sentinel():
+    channel = RunEventChannel()
+    waiting = asyncio.create_task(channel.get())
+    await asyncio.sleep(0)
+    channel.close()
+    assert await waiting is channel.END
+    assert await channel.get() is channel.END
