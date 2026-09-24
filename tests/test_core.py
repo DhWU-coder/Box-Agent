@@ -3878,7 +3878,7 @@ async def test_total_tool_call_budget_is_a_hard_loop_limit():
 
 
 @pytest.mark.asyncio
-async def test_identical_tool_calls_in_one_response_execute_only_once():
+async def test_explicitly_mergeable_tool_calls_in_one_response_execute_only_once():
     messages = _msgs()
     duplicate_calls = [
         ToolCall(
@@ -3895,6 +3895,7 @@ async def test_identical_tool_calls_in_one_response_execute_only_once():
         ]
     )
     echo = CountingEchoTool()
+    echo.deduplicate_within_batch = True
 
     events = await collect(
         run_agent_loop(

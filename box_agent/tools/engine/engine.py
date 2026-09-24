@@ -486,14 +486,18 @@ class DefaultToolEngine:
         unique, duplicates, first_by_signature = [], [], {}
         for original, normalized in zip(calls, prepared.canonicalize_calls(calls)):
             name, arguments = normalized.function.name, normalized.function.arguments
-            signature = name, json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+            deduplicate = prepared.allows_batch_deduplication(name)
+            signature = (
+                name, json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+            ) if deduplicate else None
             tool_id, server_name = prepared.target_identity(name)
             call = ToolCallRecord(normalized.id, original.function.name, name, arguments,
                                   prepared.targets.get(name), tool_id, server_name)
-            if signature in first_by_signature:
+            if deduplicate and signature in first_by_signature:
                 duplicates.append((call, first_by_signature[signature]))
             else:
-                first_by_signature[signature] = call
+                if deduplicate:
+                    first_by_signature[signature] = call
                 unique.append(call)
         if duplicates:
             _log.info("tool/dedupe skipped=%d unique=%d", len(duplicates), len(unique))

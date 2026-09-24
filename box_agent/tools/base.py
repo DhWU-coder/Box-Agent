@@ -56,6 +56,10 @@ class Tool:
 
     aliases: tuple[str, ...] = ()
     parallel_safe: bool = False
+    # Trusted opt-in: identical calls in one model response may share an
+    # execution and its outcome (including failure). This also skips per-call
+    # execution hooks for duplicates. Read-only or idempotent is not enough.
+    deduplicate_within_batch: bool = False
     # Trusted interactive tools may stop the current Agent turn after a
     # successful invocation. Dynamic/MCP and ordinary tools inherit False.
     ends_turn_on_success: bool = False
