@@ -18,6 +18,8 @@ class AgentClient:
 
     The caller retains Session creation and cleanup. ``start`` exposes streaming
     and control through a handle; ``run`` consumes events and returns the result.
+    Use ``RunResult.termination_kind`` to distinguish budgets and interruption
+    from normal turn completion. Legacy ``COMPLETED`` is not task verification.
     """
 
     def __init__(

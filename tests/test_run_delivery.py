@@ -52,3 +52,20 @@ def test_delivery_modules_do_not_import_adapters_or_models():
                        else [item.name for item in node.names] if isinstance(node, ast.Import)
                        else [])
             assert not any(set(module.split(".")) & {"acp", "cli", "llm"} for module in imports)
+
+
+@pytest.mark.parametrize("reason,kind", [
+    ("end_turn", "normal"), ("max_steps", "budget_exhausted"),
+    ("max_tokens", "budget_exhausted"), ("interrupted", "interrupted"),
+    ("cancelled", "cancelled"), ("waiting_for_user", "waiting_for_user"),
+    ("error", "failed"), ("vendor_reason", "unknown"),
+])
+def test_result_classifies_termination_without_changing_legacy_status(reason, kind):
+    import json
+    from box_agent.api import RunResult, RunStatus
+
+    result = RunResult("r", RunStatus.COMPLETED, reason, "answer")
+    assert result.status is RunStatus.COMPLETED
+    assert result.stop_reason == reason
+    assert result.termination_kind == kind
+    assert json.loads(json.dumps(result.to_dict()))["termination_kind"] == kind
