@@ -109,11 +109,12 @@ def test_windows_worker_returns_utf8_and_releases_admission(runtime, tmp_path, m
 
 
 @native_windows
-def test_windows_timeout_reaps_descendants_and_preserves_unrelated_process(runtime, tmp_path):
+@pytest.mark.parametrize("child_python", [sys.executable, sys._base_executable], ids=["venv", "base"])
+def test_windows_timeout_reaps_descendants_and_preserves_unrelated_process(runtime, tmp_path, child_python):
     pidfile = tmp_path / "child.pid"
     script = worker(tmp_path, f"""import subprocess,sys,time,json,psutil
 from pathlib import Path
-child = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(120)'])
+child = subprocess.Popen([{child_python!r}, '-c', 'import time;time.sleep(120)'])
 Path({str(pidfile)!r}).write_text(json.dumps([child.pid, psutil.Process(child.pid).create_time()]))
 time.sleep(120)""")
     other = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])

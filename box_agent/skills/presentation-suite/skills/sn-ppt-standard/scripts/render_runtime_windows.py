@@ -63,6 +63,8 @@ class WindowsJob:
             "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
             "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
             "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "IsProcessInJob": ([wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+            "WaitForSingleObject": ([wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
             "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
         }
         for name, (arguments, result) in signatures.items():
@@ -106,6 +108,52 @@ class WindowsJob:
     def terminate(self):
         if not self.api.TerminateJobObject(self.handle, 1):
             self._raise("TerminateJobObject")
+
+    def retain_processes(self, deadline):
+        """Retain identities from this job before asynchronous termination."""
+        capacity = max(16, self.active_processes())
+        while True:
+            class ProcessList(ctypes.Structure):
+                _fields_ = [("assigned", wintypes.DWORD), ("count", wintypes.DWORD),
+                            ("pids", ctypes.c_size_t * capacity)]
+
+            listing = ProcessList()
+            if self.api.QueryInformationJobObject(self.handle, 3, ctypes.byref(listing),
+                                                 ctypes.sizeof(listing), None):
+                break
+            if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA
+                self._raise("QueryInformationJobObject process list")
+            if time.monotonic() >= deadline:
+                raise RenderCleanupError("render job process enumeration timed out")
+            capacity = max(capacity * 2, listing.assigned)
+        handles = []
+        try:
+            for pid in listing.pids[:listing.count]:
+                handle = self.api.OpenProcess(0x100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+                if not handle:
+                    if ctypes.get_last_error() == 87:  # Process already disappeared.
+                        continue
+                    self._raise("OpenProcess for cleanup")
+                handles.append(handle)
+                member = wintypes.BOOL()
+                if not self.api.IsProcessInJob(handle, self.handle, ctypes.byref(member)):
+                    self._raise("IsProcessInJob")
+                if not member.value:  # PID was reused; never retain an unrelated process.
+                    self.api.CloseHandle(handles.pop())
+            return handles
+        except BaseException:
+            for handle in handles:
+                self.api.CloseHandle(handle)
+            raise
+
+    def wait_processes(self, handles, deadline):
+        for handle in handles:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            outcome = self.api.WaitForSingleObject(handle, min(remaining_ms, 0xFFFFFFFE))
+            if outcome == 0xFFFFFFFF:
+                self._raise("WaitForSingleObject")
+            if outcome != 0:
+                raise RenderCleanupError("render process did not exit before cleanup deadline")
 
     def close(self):
         if self.handle:
@@ -236,17 +284,22 @@ class WindowsSupervisor(_Supervisor):
 
     def close(self):
         self.listener.close()
+        handles = []
         try:
+            limit = max(time.monotonic() + 0.05, self.deadline)
+            handles = self.job.retain_processes(limit)
             for connection in list(self.peers):
                 self._remove(connection)
             self.job.terminate()
-            limit = max(time.monotonic() + 0.05, self.deadline)
             while self.job.active_processes() and time.monotonic() < limit:
                 time.sleep(0.02)
             if self.job.active_processes():
                 raise RenderCleanupError("render Job Object retained live processes after cleanup")
+            self.job.wait_processes(handles, limit)
             self.process.wait(timeout=max(0.05, self.deadline - time.monotonic()))
         finally:
+            for handle in handles:
+                self.job.api.CloseHandle(handle)
             # The parent exclusively owns this handle. A hard parent exit also
             # invokes KILL_ON_JOB_CLOSE without depending on Python callbacks.
             self.job.close()
