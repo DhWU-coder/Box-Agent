@@ -110,7 +110,6 @@ config = Config.load()
 assert not config.agent.enable_memory and not config.agent.enable_memory_extraction
 assert not config.tools.enable_mcp and not config.tools.enable_skills and not config.hooks.hooks
 def forbidden(*args, **kwargs): raise AssertionError("Unexpected background or network work")
-socket.socket.connect = forbidden
 acp.MemoryManager = forbidden
 calls = []
 def fake_llm(**kwargs):
@@ -131,6 +130,7 @@ acp.stdio_streams_largebuf = streams
 
 async def probe():
     loop = asyncio.get_running_loop()
+    socket.socket.connect = forbidden
     shutdown = []
     loop.add_signal_handler = lambda signal, callback: shutdown.append(callback)
     loop.remove_signal_handler = lambda signal: True

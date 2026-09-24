@@ -170,6 +170,7 @@ class TestDetectDangerousCommand:
 
         assert detect_dangerous_command(command) is not None
 
+    @pytest.mark.usefixtures("posix_command_parser")
     def test_depth_limited_nested_shell_danger_fails_closed(self):
         command = "bash -c \"bash -c \\\"bash -c 'rm cache.tmp'\\\"\""
 
@@ -305,6 +306,7 @@ class TestDetectDangerousCommand:
             "find . -name '*.tmp' -exec rm {} +",
         ],
     )
+    @pytest.mark.usefixtures("posix_command_parser")
     def test_dispatched_dangerous_commands_require_approval(self, command):
         assert detect_dangerous_command(command) is not None
 

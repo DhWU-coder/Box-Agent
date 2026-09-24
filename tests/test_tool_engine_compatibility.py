@@ -258,7 +258,8 @@ def _normalized_schema(schema, profile):
     # Only the isolated workspace prefix changes between test runs. Preserve
     # descriptions, parameter types, bounds, enums, defaults and array ordering.
     serialized = json.dumps(schema, ensure_ascii=False)
-    return json.loads(serialized.replace(str(profile), "<PROFILE>"))
+    serialized = serialized.replace(json.dumps(str(profile / "workspace"), ensure_ascii=False)[1:-1], "<PROFILE>/workspace")
+    return json.loads(serialized.replace(json.dumps(str(profile), ensure_ascii=False)[1:-1], "<PROFILE>"))
 
 
 def _assert_schema_contract(tools, profile):

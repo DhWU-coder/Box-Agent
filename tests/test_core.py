@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import mimetypes
 import os
 import shutil
 import subprocess
@@ -5443,16 +5444,16 @@ async def test_browser_snapshot_relative_filename_cannot_escape_session_cwd(tmp_
     assert "BROWSER_SNAPSHOT_OUTPUT_PATH_INVALID" in (result.error or "")
 
 
-def test_artifact_detect_data_kind(tmp_path):
-    """CSV under a cwd child directory is classified as data."""
+def test_artifact_detect_spreadsheet_kind(tmp_path):
+    """CSV under a cwd child directory is classified as a spreadsheet."""
     out = tmp_path / "output"
     out.mkdir()
     (out / "results.csv").write_text("a,b\n1,2")
     arts = _detect_artifacts("t2", "jupyter", "Saved to [output/results.csv]", str(tmp_path))
     assert len(arts) == 1
-    assert arts[0].kind == "data"
-    assert "csv" in arts[0].mime
-    assert arts[0].rel_path == "output/results.csv"
+    assert arts[0].kind == "spreadsheet"
+    assert arts[0].mime == mimetypes.guess_type("results.csv")[0]
+    assert Path(arts[0].rel_path) == Path("output/results.csv")
 
 
 def test_browser_screenshot_is_persisted_inside_session_cwd(tmp_path):
