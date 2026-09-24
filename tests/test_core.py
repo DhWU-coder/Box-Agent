@@ -413,7 +413,20 @@ async def test_nested_tool_calls_do_not_consume_parent_tool_budget(
             LLMResponse(content="done", finish_reason="stop"),
         ]
     )
-    nested_tool = NestedDelegationTool(nested_tool_calls=200)
+    class IntegratedDelegationTool(NestedDelegationTool):
+        supports_delegated_budget = True
+        uses_invocation_context = True
+
+        async def _invoke_validated(self, arguments, *, context):
+            from box_agent.tools.delegated_budget import bind_budgets
+            from box_agent.tools.engine.execution import invoke_tool_once
+
+            with bind_budgets(context.child_budgets):
+                for _ in range(self.nested_tool_calls):
+                    assert (await invoke_tool_once(EchoTool(), {"text": "child work"})).success
+            return await super()._invoke_validated(arguments, context=context)
+
+    nested_tool = IntegratedDelegationTool(nested_tool_calls=200)
 
     events = await collect(
         run_agent_loop(

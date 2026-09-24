@@ -254,6 +254,8 @@ class AgentSession:
         """Request cooperative cancellation through this session's options."""
 
         self.cancelled = True
+        if self._run_handle.is_active:
+            self._run_handle.request_cancel()
 
     async def run_events(
         self,

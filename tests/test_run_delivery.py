@@ -138,3 +138,36 @@ async def test_close_wakes_empty_channel_consumer_without_queued_sentinel():
     channel.close()
     assert await waiting is channel.END
     assert await channel.get() is channel.END
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_first", [False, True])
+async def test_first_registered_consumer_wins_result_stream_race(stream_first):
+    gate = asyncio.Event()
+
+    async def events():
+        await gate.wait()
+        yield ContentEvent("visible")
+        yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="done")
+
+    handle = AgentRunHandle.for_run(state=SimpleNamespace(), run_id="race", events_factory=events)
+    stream = handle.events()
+    if stream_first:
+        next_event = asyncio.create_task(anext(stream))
+        result_waiter = asyncio.create_task(handle.result())
+    else:
+        result_waiter = asyncio.create_task(handle.result())
+        next_event = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    gate.set()
+    if stream_first:
+        assert (await next_event).payload.content == "visible"
+        with pytest.raises(RuntimeError, match="already have a consumer"):
+            await anext(handle.events())
+        assert len([event async for event in stream]) == 1
+    else:
+        with pytest.raises(RuntimeError, match="result-only"):
+            await next_event
+    result = await result_waiter
+    assert result is await handle.result()
+    await handle.aclose()

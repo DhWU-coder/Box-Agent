@@ -4980,6 +4980,8 @@ class BoxACPAgent:
                             pass  # StepStart, SummarizationEvent, PermissionRequestEvent, etc.
 
                 except Exception as exc:
+                    if isinstance(exc, TimeoutError):
+                        raise
                     log.exception("event/error", exc, session_id=session_id, event=type(event).__name__)
                     # Don't break the loop — continue processing events
 

@@ -9,7 +9,7 @@ from .agent import Agent
 from .agent_runtime import AgentFactory, build_agent
 from .agent_run import AgentRunHandle
 from .api import RunDeliveryOptions, RunRequest
-from .run_control import PermissionBroker, RunControl
+from .run_control import CancellablePermissionNegotiator, PermissionBroker, RunControl
 
 
 class AgentService:
@@ -85,6 +85,10 @@ class AgentService:
                 run_id=request.run_id,
                 grant_store=getattr(session, "grant_store", None),
             )
+        elif permission_broker is not None:
+            options = replace(options, permission_negotiator=CancellablePermissionNegotiator(
+                permission_broker, control,
+            ))
 
         handle = AgentRunHandle.for_run(
             delivery_options=delivery_options,

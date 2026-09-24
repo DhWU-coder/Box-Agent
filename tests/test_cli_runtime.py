@@ -88,6 +88,8 @@ def test_cli_public_path_reaches_plugin_composition_and_agent_loop_kernel(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("BOX_AGENT_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     config_path = tmp_path / "config.yaml"
     config_path.write_text("api_key: test\n", encoding="utf-8")
     workspace = tmp_path / "workspace"

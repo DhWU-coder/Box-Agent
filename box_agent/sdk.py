@@ -42,12 +42,10 @@ class AgentClient:
         self, request: RunRequest, *, options: AgentRunOptions | None = None,
         delivery_options: RunDeliveryOptions | None = None,
     ) -> RunResult:
-        """Run to completion, consuming events without rendering them."""
+        """Use result-only delivery, including the host permission callback."""
 
         handle = await self.start(request, options=options, delivery_options=delivery_options)
         async with handle:
-            async for _event in handle.events():
-                pass
             return await handle.result()
 
 

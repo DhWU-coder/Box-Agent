@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
 from uuid import uuid4
 
 from .api import ControlCommand
@@ -19,6 +20,7 @@ class RunControl:
         self._resume_gate.set()
         self._state = "running"
         self._cancelled = False
+        self._cancel_gate = asyncio.Event()
 
     @property
     def state(self) -> str:
@@ -42,6 +44,10 @@ class RunControl:
         self._cancelled = True
         self._state = "cancelled"
         self._resume_gate.set()
+        self._cancel_gate.set()
+
+    async def wait_cancelled(self) -> None:
+        await self._cancel_gate.wait()
 
     async def checkpoint(self) -> bool:
         """Wait until this run may make its next externally visible action."""
@@ -55,6 +61,28 @@ class RunControl:
             return False
         self._state = "running"
         return True
+
+
+class CancellablePermissionNegotiator:
+    """Keep host permission waits within the shared run cancellation scope."""
+
+    def __init__(self, delegate: Any, control: RunControl) -> None:
+        self._delegate = delegate
+        self._control = control
+
+    async def negotiate(self, request: Mapping[str, object]) -> bool:
+        if self._control.cancelled:
+            return False
+        pending = asyncio.create_task(self._delegate.negotiate(request))
+        cancelled = asyncio.create_task(self._control.wait_cancelled())
+        try:
+            await asyncio.wait((pending, cancelled), return_when=asyncio.FIRST_COMPLETED)
+            return False if self._control.cancelled else await pending
+        finally:
+            for task in (pending, cancelled):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pending, cancelled, return_exceptions=True)
 
 
 class PermissionBroker:
