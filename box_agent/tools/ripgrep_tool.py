@@ -501,6 +501,7 @@ class GlobTool(_RipgrepTool):
         output_chars = 0
         truncated = False
         timed_out = False
+        undecodable_paths = False
         try:
             while True:
                 remaining = deadline - time.monotonic()
@@ -518,7 +519,11 @@ class GlobTool(_RipgrepTool):
                     break
                 if not raw_record:
                     break
-                relative = raw_record.rstrip(b"\0").decode("utf-8", errors="replace")
+                try:
+                    relative = raw_record.rstrip(b"\0").decode("utf-8")
+                except UnicodeDecodeError:
+                    undecodable_paths = True
+                    continue
                 if not relative:
                     continue
                 if not _matches_file_pattern(relative, compiled_patterns):
@@ -573,14 +578,21 @@ class GlobTool(_RipgrepTool):
                 "\n\n[Warning: some files or directories could not be read; "
                 "results may be incomplete.]"
             )
+        if undecodable_paths:
+            content += (
+                "\n\n[Warning: non-UTF-8 paths were skipped because replacing bytes "
+                "would identify a different file; results are incomplete.]"
+            )
         model_context = None
-        if truncated or timed_out or partial:
+        if truncated or timed_out or partial or undecodable_paths:
             reason = (
                 "timed out"
                 if timed_out
                 else "result limit reached"
                 if truncated
                 else "some paths could not be read"
+                if partial
+                else "non-UTF-8 paths were skipped"
             )
             model_context = (
                 f"[Incomplete glob results: {reason}; pattern={pattern}; "
@@ -597,7 +609,7 @@ class GlobTool(_RipgrepTool):
             raw_output={
                 "path": str(search_path),
                 "returned_files": len(files),
-                "truncated": truncated or timed_out or partial,
+                "truncated": truncated or timed_out or partial or undecodable_paths,
                 "files": files,
             },
         )
@@ -710,6 +722,7 @@ class GrepTool(_RipgrepTool):
         truncated = False
         timed_out = False
         oversized_record = False
+        undecodable_paths = False
         try:
             while True:
                 remaining = deadline - time.monotonic()
@@ -745,7 +758,11 @@ class GrepTool(_RipgrepTool):
                     or not isinstance(line_number, int)
                 ):
                     continue
-                raw_path = path_bytes.decode("utf-8", errors="replace")
+                try:
+                    raw_path = path_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    undecodable_paths = True
+                    continue
                 text = line_bytes.decode("utf-8", errors="replace")
                 if compiled_include is not None and not _matches_file_pattern(
                     raw_path, compiled_include
@@ -823,8 +840,13 @@ class GrepTool(_RipgrepTool):
             )
         if oversized_record:
             content += "\n\n[Warning: one or more oversized matching lines were skipped.]"
+        if undecodable_paths:
+            content += (
+                "\n\n[Warning: non-UTF-8 paths were skipped because replacing bytes "
+                "would identify a different file; results are incomplete.]"
+            )
         model_context = None
-        if truncated or timed_out or partial or oversized_record:
+        if truncated or timed_out or partial or undecodable_paths or oversized_record:
             reason = (
                 "timed out"
                 if timed_out
@@ -832,6 +854,8 @@ class GrepTool(_RipgrepTool):
                 if truncated
                 else "some paths could not be read"
                 if partial
+                else "non-UTF-8 paths were skipped"
+                if undecodable_paths
                 else "oversized matching lines were skipped"
             )
             model_context = (
@@ -848,7 +872,9 @@ class GrepTool(_RipgrepTool):
             raw_output={
                 "path": str(search_path),
                 "returned_matches": len(matches),
-                "truncated": truncated or timed_out or partial or oversized_record,
+                "truncated": (
+                    truncated or timed_out or partial or undecodable_paths or oversized_record
+                ),
                 "matches": matches,
             },
         )

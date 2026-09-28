@@ -685,7 +685,9 @@ async def test_grep_decodes_non_utf8_lines_instead_of_dropping_matches(
     not sys.platform.startswith("linux"),
     reason="only Linux filesystems accept non-UTF-8 file names",
 )
-async def test_grep_decodes_non_utf8_paths(tmp_path: Path) -> None:
+async def test_grep_marks_non_utf8_paths_incomplete_without_fabricating_names(
+    tmp_path: Path,
+) -> None:
     with open(os.path.join(os.fsencode(tmp_path), b"bad\xff.py"), "wb") as handle:
         handle.write(b"needle\n")
 
@@ -693,9 +695,46 @@ async def test_grep_decodes_non_utf8_paths(tmp_path: Path) -> None:
         workspace_dir=str(tmp_path), executable=require_rg()
     ).execute(pattern="needle")
 
-    assert [match["path"] for match in result.raw_output["matches"]] == [
-        "bad�.py"
-    ]
+    assert result.raw_output["matches"] == []
+    assert result.raw_output["truncated"] is True
+    assert "non-UTF-8 paths" in result.content
+    assert "Incomplete grep results" in result.model_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_cls", [GlobTool, GrepTool])
+async def test_search_marks_undecodable_paths_incomplete(
+    tmp_path: Path, tool_cls
+) -> None:
+    script = (
+        "import base64, json, sys\n"
+        "if '--files' in sys.argv:\n"
+        "    sys.stdout.buffer.write(b'bad\\xff.py\\0')\n"
+        "else:\n"
+        "    print(json.dumps({'type':'match','data':{'path':{'bytes':base64.b64encode(b'bad\\xff.py').decode()},'lines':{'text':'needle\\n'},'line_number':1,'submatches':[{'start':0}]}}))\n"
+    )
+    result = await fake_rg_tool(tool_cls, tmp_path, script).execute(
+        pattern="needle" if tool_cls is GrepTool else "*.py"
+    )
+    assert result.success is True
+    assert result.raw_output["truncated"] is True
+    assert result.raw_output.get("matches", result.raw_output.get("files")) == []
+    assert "non-UTF-8 paths" in result.content
+    assert "Incomplete" in result.model_context
+
+
+@pytest.mark.asyncio
+async def test_grep_marks_skipped_oversized_matching_lines_incomplete(tmp_path: Path) -> None:
+    (tmp_path / "large.log").write_text(
+        "needle " + "x" * 1_100_000 + "\n", encoding="utf-8"
+    )
+    result = await GrepTool(
+        workspace_dir=str(tmp_path), executable=require_rg()
+    ).execute(pattern="needle")
+    assert result.success is True
+    assert result.raw_output["truncated"] is True
+    assert "oversized" in result.content
+    assert "Incomplete grep results" in result.model_context
 
 
 @pytest.mark.asyncio

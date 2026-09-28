@@ -79,7 +79,10 @@ async def test_shared_assembly_passes_session_mode_to_workspace_tools(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_shared_assembly_keeps_legacy_workspace_tools_factories_working(tmp_path):
+@pytest.mark.parametrize("factory_kind", ["legacy", "positional_only", "opaque"])
+async def test_shared_assembly_keeps_legacy_workspace_tools_factories_working(
+    tmp_path, factory_kind
+):
     from box_agent.agent_session import AgentSession
     from box_agent.session_context import HostBindings, SessionOptions
 
@@ -93,6 +96,24 @@ async def test_shared_assembly_keeps_legacy_workspace_tools_factories_working(tm
     ):
         calls.append(workspace_dir)
         return None
+
+    def positional_only_workspace_tools(
+        tools, config, workspace_dir, session_mode=None, /, *,
+        sandbox_mode=None, allow_full_access=False, non_interactive=False,
+        output=None, llm=None, permission_engine=None, skill_runtime_context=None,
+        skill_loader=None, skill_access_filter=None, env_context=None,
+        capability_state_provider=None,
+    ):
+        calls.append(workspace_dir)
+        return None
+
+    factory = (
+        positional_only_workspace_tools
+        if factory_kind == "positional_only"
+        else legacy_workspace_tools
+    )
+    if factory_kind == "opaque":
+        factory.__signature__ = "unavailable"
 
     config = Config(
         llm=LLMConfig(api_key="test"),
@@ -119,7 +140,7 @@ async def test_shared_assembly_keeps_legacy_workspace_tools_factories_working(tm
         host=HostBindings(
             llm_client=DoneLLM(),
             base_tools=[],
-            workspace_tools_factory=legacy_workspace_tools,
+            workspace_tools_factory=factory,
         ),
     )
     try:

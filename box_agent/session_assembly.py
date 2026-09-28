@@ -153,9 +153,16 @@ def _accepts_keyword(func: Any, name: str) -> bool:
     try:
         parameters = inspect.signature(func).parameters.values()
     except (TypeError, ValueError):
-        return True
+        return False
     return any(
-        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == name
+            and parameter.kind in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        )
         for parameter in parameters
     )
 
