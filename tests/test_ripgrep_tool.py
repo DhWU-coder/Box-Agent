@@ -24,8 +24,31 @@ RG = shutil.which("rg")
 
 def require_rg() -> str:
     if RG is None:
+        if os.environ.get("BOX_AGENT_TEST_REQUIRE_RG"):
+            pytest.fail("ripgrep is required by BOX_AGENT_TEST_REQUIRE_RG")
         pytest.skip("ripgrep is not installed")
     return RG
+
+
+def fake_rg_tool(tool_cls, tmp_path: Path, script: str, **kwargs):
+    """Run a Python stand-in for ripgrep; portable to Windows (no shebang)."""
+
+    script_path = tmp_path / "fake_rg.py"
+    script_path.write_text(script, encoding="utf-8")
+
+    class FakeRipgrepTool(tool_cls):
+        spawned: list[asyncio.subprocess.Process] = []
+
+        async def _spawn(self, *, cwd, args):
+            process, error = await super()._spawn(
+                cwd=cwd, args=[str(script_path), *args]
+            )
+            if process is not None:
+                self.spawned.append(process)
+            return process, error
+
+    kwargs.setdefault("workspace_dir", str(tmp_path))
+    return FakeRipgrepTool(executable=sys.executable, **kwargs)
 
 
 def test_resolve_ripgrep_prefers_injected_executable(tmp_path: Path) -> None:
@@ -71,9 +94,7 @@ async def test_stderr_reader_drains_after_retained_output_is_truncated() -> None
 
 @pytest.mark.asyncio
 async def test_search_tools_do_not_request_full_result_sorting(tmp_path: Path) -> None:
-    executable = tmp_path / "fake-rg"
-    executable.write_text(
-        "#!" + sys.executable + "\n"
+    script = (
         "import json, sys\n"
         "if any(arg.startswith('--sort') for arg in sys.argv[1:]):\n"
         "    print('sorting disables bounded streaming', file=sys.stderr)\n"
@@ -83,17 +104,15 @@ async def test_search_tools_do_not_request_full_result_sorting(tmp_path: Path) -
         "else:\n"
         "    print(json.dumps({'type': 'match', 'data': {"
         "'path': {'text': 'src/app.py'}, 'line_number': 1, "
-        "'lines': {'text': 'needle\\n'}, 'submatches': [{'start': 0}]}}))\n",
-        encoding="utf-8",
+        "'lines': {'text': 'needle\\n'}, 'submatches': [{'start': 0}]}}))\n"
     )
-    executable.chmod(0o755)
 
-    glob_result = await GlobTool(
-        workspace_dir=str(tmp_path), executable=str(executable)
-    ).execute(pattern="*.py")
-    grep_result = await GrepTool(
-        workspace_dir=str(tmp_path), executable=str(executable)
-    ).execute(pattern="needle")
+    glob_result = await fake_rg_tool(GlobTool, tmp_path, script).execute(
+        pattern="*.py"
+    )
+    grep_result = await fake_rg_tool(GrepTool, tmp_path, script).execute(
+        pattern="needle"
+    )
 
     assert glob_result.success is True
     assert glob_result.raw_output["files"] == ["src/app.py"]
@@ -105,35 +124,28 @@ async def test_search_tools_do_not_request_full_result_sorting(tmp_path: Path) -
 
 @pytest.mark.asyncio
 async def test_cancelling_search_terminates_the_ripgrep_process(tmp_path: Path) -> None:
-    executable = tmp_path / "slow-rg"
-    pid_file = tmp_path / "slow-rg.pid"
-    executable.write_text(
-        "#!" + sys.executable + "\n"
+    pid_file = tmp_path / "fake_rg.pid"
+    tool = fake_rg_tool(
+        GlobTool,
+        tmp_path,
         "import os, pathlib, time\n"
         "pathlib.Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))\n"
         "while True:\n"
         "    time.sleep(1)\n",
-        encoding="utf-8",
     )
-    executable.chmod(0o755)
-    task = asyncio.create_task(
-        GlobTool(workspace_dir=str(tmp_path), executable=str(executable)).execute(
-            pattern="*.py"
-        )
-    )
-    for _ in range(100):
+    task = asyncio.create_task(tool.execute(pattern="*.py"))
+    for _ in range(500):
         if pid_file.exists():
             break
         await asyncio.sleep(0.01)
     assert pid_file.exists()
-    pid = int(pid_file.read_text(encoding="utf-8"))
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert len(tool.spawned) == 1
+    assert tool.spawned[0].returncode is not None
 
 
 @pytest.mark.asyncio
@@ -556,3 +568,97 @@ async def test_glob_returns_permission_request_for_external_path(tmp_path: Path)
     assert result.success is False
     assert result.permission_request is not None
     assert result.permission_request["path"] == str(external)
+
+
+
+@pytest.mark.asyncio
+async def test_search_tools_include_hidden_files_but_not_git_metadata(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config.yml").write_text("needle: git\n", encoding="utf-8")
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "ci.yml").write_text(
+        "needle: ci\n", encoding="utf-8"
+    )
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "stale.yml").write_text("needle: cache\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".cache/\n", encoding="utf-8")
+    rg = require_rg()
+
+    by_path = await GlobTool(workspace_dir=str(tmp_path), executable=rg).execute(
+        pattern=".github/**/*.yml"
+    )
+    by_name = await GlobTool(workspace_dir=str(tmp_path), executable=rg).execute(
+        pattern="*.yml"
+    )
+    grep = await GrepTool(workspace_dir=str(tmp_path), executable=rg).execute(
+        pattern="needle"
+    )
+
+    assert by_path.raw_output["files"] == [".github/workflows/ci.yml"]
+    assert by_name.raw_output["files"] == [".github/workflows/ci.yml"]
+    assert [match["path"] for match in grep.raw_output["matches"]] == [
+        ".github/workflows/ci.yml"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grep_reports_character_columns_for_non_ascii_lines(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "app.py").write_text("# 中文注释 needle\n", encoding="utf-8")
+
+    result = await GrepTool(
+        workspace_dir=str(tmp_path), executable=require_rg()
+    ).execute(pattern="needle")
+
+    assert result.success is True
+    assert result.raw_output["matches"][0]["column"] == 8
+    assert result.content.startswith("app.py:1:8:")
+
+
+_PARTIAL_EXIT_SCRIPT = (
+    "import json, sys\n"
+    "if '--files' in sys.argv:\n"
+    "    print('src/app.py')\n"
+    "else:\n"
+    "    print(json.dumps({'type': 'match', 'data': {"
+    "'path': {'text': 'src/app.py'}, 'line_number': 1, "
+    "'lines': {'text': 'needle\\n'}, 'submatches': [{'start': 0}]}}))\n"
+    "sys.exit(2)\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_cls", "pattern", "result_key"),
+    [(GlobTool, "*.py", "files"), (GrepTool, "needle", "matches")],
+)
+async def test_search_keeps_results_when_some_paths_are_unreadable(
+    tmp_path: Path, tool_cls, pattern: str, result_key: str
+) -> None:
+    # ripgrep exits 2 when a directory or file cannot be read, even though
+    # --no-messages hides the per-path error and other matches were found.
+    result = await fake_rg_tool(tool_cls, tmp_path, _PARTIAL_EXIT_SCRIPT).execute(
+        pattern=pattern
+    )
+
+    assert result.success is True
+    assert len(result.raw_output[result_key]) == 1
+    assert result.raw_output["truncated"] is True
+    assert "could not be read" in result.content
+    assert result.model_context is not None
+    assert "some paths could not be read" in result.model_context
+
+
+@pytest.mark.asyncio
+async def test_search_reports_other_ripgrep_failures_as_errors(tmp_path: Path) -> None:
+    result = await fake_rg_tool(
+        GrepTool,
+        tmp_path,
+        "import sys\nprint('boom', file=sys.stderr)\nsys.exit(3)\n",
+    ).execute(pattern="needle")
+
+    assert result.success is False
+    assert result.error == "boom"

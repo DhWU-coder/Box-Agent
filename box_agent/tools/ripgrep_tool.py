@@ -296,6 +296,28 @@ class _RipgrepTool(Tool):
             process.kill()
             await process.wait()
 
+    @staticmethod
+    def _exit_status(
+        returncode: int | None, *, has_results: bool, stderr: str
+    ) -> tuple[ToolResult | None, bool]:
+        """Map ripgrep's exit code to ``(error, partial)``.
+
+        Exit code 2 also covers per-path I/O errors (unreadable directories,
+        locked files), which ``--no-messages`` keeps silent. Keep whatever was
+        found in that case instead of discarding it as a failed search.
+        """
+        if returncode in {0, 1}:
+            return None, False
+        if returncode == 2 and (has_results or not stderr.strip()):
+            return None, True
+        return (
+            ToolResult(
+                success=False,
+                error=stderr.strip() or f"ripgrep failed with exit code {returncode}",
+            ),
+            False,
+        )
+
     async def _spawn(
         self, *, cwd: Path, args: list[str]
     ) -> tuple[asyncio.subprocess.Process | None, ToolResult | None]:
@@ -330,8 +352,8 @@ class GlobTool(_RipgrepTool):
             "search path and support forms such as 'src/**/*.ts' and '*.{ts,tsx}'. "
             "Basename-only patterns match files at any depth; this tool does not return "
             "directories. Do not use glob('*') to inspect a directory; use a read-only, "
-            "non-recursive Bash directory listing instead. Respects ignore files and "
-            "returns bounded paths."
+            "non-recursive Bash directory listing instead. Includes hidden files, skips "
+            ".git, respects ignore files, and returns bounded paths."
         )
 
     @property
@@ -385,6 +407,7 @@ class GlobTool(_RipgrepTool):
             "--no-config",
             "--no-messages",
             "--color=never",
+            "--hidden",
             "--files",
             *_file_filter_args(pattern, compiled_patterns),
             "--glob=!**/.git/**",
@@ -447,12 +470,13 @@ class GlobTool(_RipgrepTool):
             if process.returncode is None:
                 await self._stop_process(process)
 
+        partial = False
         if not truncated and not timed_out and process.returncode not in {0, 1}:
-            return ToolResult(
-                success=False,
-                error=stderr.strip()
-                or f"ripgrep failed with exit code {process.returncode}",
+            exit_error, partial = self._exit_status(
+                process.returncode, has_results=bool(files), stderr=stderr
             )
+            if exit_error:
+                return exit_error
 
         content = "\n".join(files) or "No files found."
         if truncated:
@@ -466,9 +490,20 @@ class GlobTool(_RipgrepTool):
                 f"\n\n[Warning: glob timed out after {self.timeout_seconds:g} seconds; "
                 "partial results are shown.]"
             )
+        if partial:
+            content += (
+                "\n\n[Warning: some files or directories could not be read; "
+                "results may be incomplete.]"
+            )
         model_context = None
-        if truncated or timed_out:
-            reason = "timed out" if timed_out else "result limit reached"
+        if truncated or timed_out or partial:
+            reason = (
+                "timed out"
+                if timed_out
+                else "result limit reached"
+                if truncated
+                else "some paths could not be read"
+            )
             model_context = (
                 f"[Incomplete glob results: {reason}; pattern={pattern}; "
                 f"path={search_path}; returned={len(files)}. "
@@ -484,7 +519,7 @@ class GlobTool(_RipgrepTool):
             raw_output={
                 "path": str(search_path),
                 "returned_files": len(files),
-                "truncated": truncated or timed_out,
+                "truncated": truncated or timed_out or partial,
                 "files": files,
             },
         )
@@ -502,7 +537,8 @@ class GrepTool(_RipgrepTool):
         return (
             "Search file contents with ripgrep regular expressions. Optionally filter files "
             "with an include glob relative to the selected search path while retaining "
-            "ignore-file semantics. Supports path and brace patterns."
+            "ignore-file semantics. Includes hidden files and skips .git. Supports path "
+            "and brace patterns."
         )
 
     @property
@@ -573,6 +609,7 @@ class GrepTool(_RipgrepTool):
             "--no-config",
             "--no-messages",
             "--color=never",
+            "--hidden",
             "--json",
             *filter_args,
             "--glob=!**/.git/**",
@@ -645,7 +682,12 @@ class GrepTool(_RipgrepTool):
                     else {}
                 )
                 start = first.get("start")
-                column = start + 1 if isinstance(start, int) else 1
+                column = (
+                    len(text.encode("utf-8")[:start].decode("utf-8", errors="ignore"))
+                    + 1
+                    if isinstance(start, int)
+                    else 1
+                )
                 display_path = self._display_path(cwd, raw_path)
                 line = f"{display_path}:{line_number}:{column}:{preview}"
                 extra_chars = len(line) + (1 if rendered else 0)
@@ -677,12 +719,13 @@ class GrepTool(_RipgrepTool):
             if process.returncode is None:
                 await self._stop_process(process)
 
+        partial = False
         if not truncated and not timed_out and process.returncode not in {0, 1}:
-            return ToolResult(
-                success=False,
-                error=stderr.strip()
-                or f"ripgrep failed with exit code {process.returncode}",
+            exit_error, partial = self._exit_status(
+                process.returncode, has_results=bool(matches), stderr=stderr
             )
+            if exit_error:
+                return exit_error
 
         content = "\n".join(rendered) or "No matches found."
         if truncated:
@@ -692,11 +735,22 @@ class GrepTool(_RipgrepTool):
                 f"\n\n[Warning: grep timed out after {self.timeout_seconds:g} seconds; "
                 "partial results are shown.]"
             )
+        if partial:
+            content += (
+                "\n\n[Warning: some files or directories could not be read; "
+                "results may be incomplete.]"
+            )
         if oversized_record:
             content += "\n\n[Warning: one or more oversized matching lines were skipped.]"
         model_context = None
-        if truncated or timed_out:
-            reason = "timed out" if timed_out else "result limit reached"
+        if truncated or timed_out or partial:
+            reason = (
+                "timed out"
+                if timed_out
+                else "result limit reached"
+                if truncated
+                else "some paths could not be read"
+            )
             model_context = (
                 f"[Incomplete grep results: {reason}; pattern={pattern}; "
                 f"path={search_path}; include={include}; returned={len(matches)}. "
@@ -711,7 +765,7 @@ class GrepTool(_RipgrepTool):
             raw_output={
                 "path": str(search_path),
                 "returned_matches": len(matches),
-                "truncated": truncated or timed_out,
+                "truncated": truncated or timed_out or partial,
                 "matches": matches,
             },
         )
