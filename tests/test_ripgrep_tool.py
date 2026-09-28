@@ -752,3 +752,58 @@ async def test_glob_and_grep_honor_escaped_braces(tmp_path: Path) -> None:
     assert literal.raw_output["files"] == ["foo{a,b}.py"]
     assert alternatives.raw_output["files"] == ["fooa.py"]
     assert [match["path"] for match in grep.raw_output["matches"]] == ["foo{a,b}.py"]
+
+
+def _symlink_or_skip(link: Path, target: str, *, directory: bool) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except (OSError, NotImplementedError) as exc:  # Windows without symlink rights
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_cls", "path", "link_target", "directory"),
+    [
+        (GlobTool, "alias", ".git", True),
+        (GrepTool, "alias", ".git", True),
+        (GrepTool, "alias/config", ".git", True),
+        (GrepTool, "cfg", ".git/config", False),
+    ],
+)
+async def test_search_rejects_symlinks_into_git_metadata(
+    tmp_path: Path, tool_cls, path: str, link_target: str, directory: bool
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("needle\n", encoding="utf-8")
+    _symlink_or_skip(
+        tmp_path / path.split("/")[0], link_target, directory=directory
+    )
+
+    result = await tool_cls(
+        workspace_dir=str(tmp_path),
+        executable=require_rg(),
+        allow_full_access=False,
+    ).execute(pattern="*" if tool_cls is GlobTool else "needle", path=path)
+
+    assert result.success is False
+    assert ".git" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_grep_marks_results_incomplete_when_oversized_lines_are_skipped(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "huge.txt").write_text(
+        "needle " + "x" * (2 * 1024 * 1024) + "\n", encoding="utf-8"
+    )
+    (tmp_path / "small.txt").write_text("needle\n", encoding="utf-8")
+
+    result = await GrepTool(
+        workspace_dir=str(tmp_path), executable=require_rg()
+    ).execute(pattern="needle")
+
+    assert result.success is True
+    assert [match["path"] for match in result.raw_output["matches"]] == ["small.txt"]
+    assert result.raw_output["truncated"] is True
+    assert "oversized matching lines were skipped" in (result.model_context or "")

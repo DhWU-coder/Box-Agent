@@ -263,6 +263,17 @@ class _RipgrepTool(Tool):
         path = Path(raw_path).expanduser()
         return path.absolute() if path.is_absolute() else self.relative_root_dir / path
 
+    def _is_git_metadata(self, path: Path) -> bool:
+        """Whether ``path`` (or the real path a symlink points to) is inside ``.git``."""
+
+        workspace = self.workspace_dir
+        if ".git" in workspace.parts or ".git" in workspace.resolve().parts:
+            return False
+        return (
+            ".git" in Path(os.path.normpath(path)).parts
+            or ".git" in path.resolve().parts
+        )
+
     def _permission_error(self, path: Path) -> ToolResult | None:
         if self._perm:
             decision = self._perm.check(
@@ -298,9 +309,7 @@ class _RipgrepTool(Tool):
                     "home is not allowed. Choose a more specific directory."
                 ),
             )
-        if ".git" in Path(os.path.normpath(search_path)).parts and (
-            ".git" not in self.workspace_dir.parts
-        ):
+        if self._is_git_metadata(search_path):
             return None, ToolResult(
                 success=False,
                 error=(
@@ -815,13 +824,15 @@ class GrepTool(_RipgrepTool):
         if oversized_record:
             content += "\n\n[Warning: one or more oversized matching lines were skipped.]"
         model_context = None
-        if truncated or timed_out or partial:
+        if truncated or timed_out or partial or oversized_record:
             reason = (
                 "timed out"
                 if timed_out
                 else "result limit reached"
                 if truncated
                 else "some paths could not be read"
+                if partial
+                else "oversized matching lines were skipped"
             )
             model_context = (
                 f"[Incomplete grep results: {reason}; pattern={pattern}; "
@@ -837,7 +848,7 @@ class GrepTool(_RipgrepTool):
             raw_output={
                 "path": str(search_path),
                 "returned_matches": len(matches),
-                "truncated": truncated or timed_out or partial,
+                "truncated": truncated or timed_out or partial or oversized_record,
                 "matches": matches,
             },
         )
