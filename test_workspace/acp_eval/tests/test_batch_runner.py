@@ -13,6 +13,21 @@ from acp_eval.batch_runner import load_dataset, run_batch
 from acp_eval.cli import main
 
 
+@pytest.mark.parametrize("platform_name,parts", [
+    ("win32", ("Scripts", "python.exe")), ("linux", ("bin", "python")),
+])
+def test_acp_uses_repository_python_on_each_platform(tmp_path, monkeypatch, platform_name, parts):
+    executable = tmp_path / ".venv" / parts[0] / parts[1]
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    monkeypatch.setattr(batch_runner_module.sys, "platform", platform_name)
+    assert batch_runner_module._python_executable(tmp_path) == str(executable)
+
+
+def test_acp_falls_back_to_current_python_without_repository_venv(tmp_path):
+    assert batch_runner_module._python_executable(tmp_path) == batch_runner_module.sys.executable
+
+
 def read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(value, dict)
