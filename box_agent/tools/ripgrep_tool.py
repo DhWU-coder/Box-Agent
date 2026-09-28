@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
 import os
@@ -31,11 +32,23 @@ _FILTER_TYPE = "boxagent"
 _MAX_GLOB_ALTERNATIVES = 256
 
 
+def _unescaped(value: str, start: int = 0):
+    """Yield ``(index, character)`` pairs, skipping backslash-escaped characters."""
+
+    index = start
+    while index < len(value):
+        if value[index] == "\\":
+            index += 2
+            continue
+        yield index, value[index]
+        index += 1
+
+
 def _brace_choices(value: str) -> list[str]:
     choices: list[str] = []
     depth = 0
     start = 0
-    for index, character in enumerate(value):
+    for index, character in _unescaped(value):
         if character == "{":
             depth += 1
         elif character == "}":
@@ -60,16 +73,18 @@ def _expand_braces(pattern: str) -> tuple[str, ...]:
         value = pending.pop()
         search_from = 0
         while True:
-            opening = value.find("{", search_from)
+            opening = next(
+                (i for i, ch in _unescaped(value, search_from) if ch == "{"), -1
+            )
             if opening < 0:
                 expanded.append(value)
                 break
             depth = 0
             closing = -1
-            for index in range(opening, len(value)):
-                if value[index] == "{":
+            for index, character in _unescaped(value, opening):
+                if character == "{":
                     depth += 1
-                elif value[index] == "}":
+                elif character == "}":
                     depth -= 1
                     if depth == 0:
                         closing = index
@@ -103,9 +118,30 @@ def _normalize_glob_pattern(pattern: str) -> str:
     return pattern
 
 
+def _to_fnmatch(part: str) -> str:
+    """Translate ripgrep glob escapes (``\\*``, ``\\{``...) to fnmatch syntax."""
+
+    translated: list[str] = []
+    index = 0
+    while index < len(part):
+        character = part[index]
+        if character == "\\" and index + 1 < len(part):
+            escaped = part[index + 1]
+            translated.append(f"[{escaped}]" if escaped in "*?[" else escaped)
+            index += 2
+            continue
+        translated.append(character)
+        index += 1
+    return "".join(translated)
+
+
 def _compile_file_patterns(pattern: str) -> tuple[tuple[str, ...], ...]:
     return tuple(
-        tuple(part for part in expanded.split("/") if part)
+        tuple(
+            part if part == "**" else _to_fnmatch(part)
+            for part in expanded.split("/")
+            if part
+        )
         for expanded in _expand_braces(_normalize_glob_pattern(pattern))
     )
 
@@ -113,9 +149,13 @@ def _compile_file_patterns(pattern: str) -> tuple[tuple[str, ...], ...]:
 def _file_filter_args(
     pattern: str, compiled_patterns: tuple[tuple[str, ...], ...]
 ) -> list[str]:
-    """Let ripgrep filter name globs; path globs are filtered after discovery."""
+    """Let ripgrep filter name globs; path globs are filtered after discovery.
 
-    if any(len(parts) > 1 for parts in compiled_patterns):
+    Escaped patterns are also post-filtered only: ripgrep treats ``\\`` as a
+    path separator rather than an escape on Windows.
+    """
+
+    if "\\" in pattern or any(len(parts) > 1 for parts in compiled_patterns):
         return []
     return [
         f"--type-add={_FILTER_TYPE}:{_normalize_glob_pattern(pattern)}",
@@ -161,6 +201,21 @@ def _matches_file_pattern(
         if matches(0, 0):
             return True
     return False
+
+
+def _json_data_bytes(value: Any) -> bytes | None:
+    """Return raw bytes for ripgrep's ``{"text": ...}`` / ``{"bytes": ...}`` data."""
+
+    if not isinstance(value, dict):
+        return None
+    if isinstance(value.get("text"), str):
+        return value["text"].encode("utf-8")
+    if isinstance(value.get("bytes"), str):
+        try:
+            return base64.b64decode(value["bytes"], validate=True)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def resolve_ripgrep_executable(
@@ -241,6 +296,16 @@ class _RipgrepTool(Tool):
                 error=(
                     "BROAD_HOME_SEARCH_BLOCKED: Recursive search from the entire user "
                     "home is not allowed. Choose a more specific directory."
+                ),
+            )
+        if ".git" in Path(os.path.normpath(search_path)).parts and (
+            ".git" not in self.workspace_dir.parts
+        ):
+            return None, ToolResult(
+                success=False,
+                error=(
+                    "Searching Git metadata (.git) is not supported; use git "
+                    "commands through bash instead."
                 ),
             )
         denied = self._permission_error(search_path)
@@ -353,7 +418,8 @@ class GlobTool(_RipgrepTool):
             "Basename-only patterns match files at any depth; this tool does not return "
             "directories. Do not use glob('*') to inspect a directory; use a read-only, "
             "non-recursive Bash directory listing instead. Includes hidden files, skips "
-            ".git, respects ignore files, and returns bounded paths."
+            ".git, respects ignore files, and returns bounded paths. Put a known "
+            "directory in path rather than in the pattern to limit the scan."
         )
 
     @property
@@ -408,6 +474,7 @@ class GlobTool(_RipgrepTool):
             "--no-messages",
             "--color=never",
             "--hidden",
+            "--null",
             "--files",
             *_file_filter_args(pattern, compiled_patterns),
             "--glob=!**/.git/**",
@@ -432,15 +499,17 @@ class GlobTool(_RipgrepTool):
                     timed_out = True
                     break
                 try:
-                    raw_line = await asyncio.wait_for(
-                        process.stdout.readline(), timeout=remaining
+                    raw_record = await asyncio.wait_for(
+                        process.stdout.readuntil(b"\0"), timeout=remaining
                     )
+                except asyncio.IncompleteReadError as exc:
+                    raw_record = exc.partial
                 except asyncio.TimeoutError:
                     timed_out = True
                     break
-                if not raw_line:
+                if not raw_record:
                     break
-                relative = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                relative = raw_record.rstrip(b"\0").decode("utf-8", errors="replace")
                 if not relative:
                     continue
                 if not _matches_file_pattern(relative, compiled_patterns):
@@ -538,7 +607,8 @@ class GrepTool(_RipgrepTool):
             "Search file contents with ripgrep regular expressions. Optionally filter files "
             "with an include glob relative to the selected search path while retaining "
             "ignore-file semantics. Includes hidden files and skips .git. Supports path "
-            "and brace patterns."
+            "and brace patterns. The include glob only filters results; put a known "
+            "directory in path to limit how much is scanned."
         )
 
     @property
@@ -656,16 +726,18 @@ class GrepTool(_RipgrepTool):
                 if event.get("type") != "match":
                     continue
                 data = event.get("data", {})
-                raw_path = data.get("path", {}).get("text")
+                path_bytes = _json_data_bytes(data.get("path"))
+                line_bytes = _json_data_bytes(data.get("lines"))
                 line_number = data.get("line_number")
-                text = data.get("lines", {}).get("text")
                 submatches = data.get("submatches") or []
                 if (
-                    not isinstance(raw_path, str)
+                    path_bytes is None
+                    or line_bytes is None
                     or not isinstance(line_number, int)
-                    or not isinstance(text, str)
                 ):
                     continue
+                raw_path = path_bytes.decode("utf-8", errors="replace")
+                text = line_bytes.decode("utf-8", errors="replace")
                 if compiled_include is not None and not _matches_file_pattern(
                     raw_path, compiled_include
                 ):
@@ -683,7 +755,7 @@ class GrepTool(_RipgrepTool):
                 )
                 start = first.get("start")
                 column = (
-                    len(text.encode("utf-8")[:start].decode("utf-8", errors="ignore"))
+                    len(line_bytes[:start].decode("utf-8", errors="replace"))
                     + 1
                     if isinstance(start, int)
                     else 1

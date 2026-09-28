@@ -100,7 +100,7 @@ async def test_search_tools_do_not_request_full_result_sorting(tmp_path: Path) -
         "    print('sorting disables bounded streaming', file=sys.stderr)\n"
         "    raise SystemExit(9)\n"
         "if '--files' in sys.argv:\n"
-        "    print('src/app.py')\n"
+        "    print('src/app.py', end='\\0')\n"
         "else:\n"
         "    print(json.dumps({'type': 'match', 'data': {"
         "'path': {'text': 'src/app.py'}, 'line_number': 1, "
@@ -621,7 +621,7 @@ async def test_grep_reports_character_columns_for_non_ascii_lines(
 _PARTIAL_EXIT_SCRIPT = (
     "import json, sys\n"
     "if '--files' in sys.argv:\n"
-    "    print('src/app.py')\n"
+    "    print('src/app.py', end='\\0')\n"
     "else:\n"
     "    print(json.dumps({'type': 'match', 'data': {"
     "'path': {'text': 'src/app.py'}, 'line_number': 1, "
@@ -662,3 +662,93 @@ async def test_search_reports_other_ripgrep_failures_as_errors(tmp_path: Path) -
 
     assert result.success is False
     assert result.error == "boom"
+
+
+@pytest.mark.asyncio
+async def test_grep_decodes_non_utf8_lines_instead_of_dropping_matches(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "blob.txt").write_bytes(b"\xffneedle\n")
+
+    result = await GrepTool(
+        workspace_dir=str(tmp_path), executable=require_rg()
+    ).execute(pattern="needle")
+
+    assert result.success is True
+    assert result.raw_output["matches"] == [
+        {"path": "blob.txt", "line": 1, "column": 2, "text": "�needle"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="only Linux filesystems accept non-UTF-8 file names",
+)
+async def test_grep_decodes_non_utf8_paths(tmp_path: Path) -> None:
+    with open(os.path.join(os.fsencode(tmp_path), b"bad\xff.py"), "wb") as handle:
+        handle.write(b"needle\n")
+
+    result = await GrepTool(
+        workspace_dir=str(tmp_path), executable=require_rg()
+    ).execute(pattern="needle")
+
+    assert [match["path"] for match in result.raw_output["matches"]] == [
+        "bad�.py"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows forbids newlines in names")
+async def test_glob_keeps_newline_bearing_file_names_intact(tmp_path: Path) -> None:
+    (tmp_path / "prefix\nreported.py").write_text("", encoding="utf-8")
+
+    result = await GlobTool(
+        workspace_dir=str(tmp_path), executable=require_rg()
+    ).execute(pattern="*.py")
+
+    assert result.raw_output["files"] == ["prefix\nreported.py"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_cls", "kwargs"),
+    [
+        (GlobTool, {"pattern": "*", "path": ".git"}),
+        (GrepTool, {"pattern": "needle", "path": ".git"}),
+        (GrepTool, {"pattern": "needle", "path": ".git/config"}),
+    ],
+)
+async def test_search_rejects_git_metadata_as_search_root(
+    tmp_path: Path, tool_cls, kwargs
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("needle\n", encoding="utf-8")
+
+    result = await tool_cls(
+        workspace_dir=str(tmp_path), executable=require_rg()
+    ).execute(**kwargs)
+
+    assert result.success is False
+    assert ".git" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_glob_and_grep_honor_escaped_braces(tmp_path: Path) -> None:
+    (tmp_path / "foo{a,b}.py").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "fooa.py").write_text("needle\n", encoding="utf-8")
+    rg = require_rg()
+
+    literal = await GlobTool(workspace_dir=str(tmp_path), executable=rg).execute(
+        pattern=r"foo\{a,b\}.py"
+    )
+    alternatives = await GlobTool(
+        workspace_dir=str(tmp_path), executable=rg
+    ).execute(pattern="foo{a,b}.py")
+    grep = await GrepTool(workspace_dir=str(tmp_path), executable=rg).execute(
+        pattern="needle", include=r"foo\{a,b\}.py"
+    )
+
+    assert literal.raw_output["files"] == ["foo{a,b}.py"]
+    assert alternatives.raw_output["files"] == ["fooa.py"]
+    assert [match["path"] for match in grep.raw_output["matches"]] == ["foo{a,b}.py"]

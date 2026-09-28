@@ -7,6 +7,7 @@ run outside the Host activation lock, within the runtime initialization lease.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -146,6 +147,19 @@ def _bind_skill_runtime(resources: SessionResources) -> None:
             session_log.prepare_resume()
 
 
+def _accepts_keyword(func: Any, name: str) -> bool:
+    """Whether a host callback accepts ``name`` (keeps older factories working)."""
+
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 async def prepare_tools(resources: SessionResources) -> None:
     context = resources.context
     host, options, config = context.host, context.options, context.config
@@ -226,7 +240,8 @@ async def prepare_tools(resources: SessionResources) -> None:
             if isinstance(tool, (GetSkillTool, ListSkillsTool)) else tool
             for tool in resources.tools
         ]
-    scratch = (host.workspace_tools_factory or add_workspace_tools)(
+    workspace_tools_factory = host.workspace_tools_factory or add_workspace_tools
+    scratch = workspace_tools_factory(
         resources.tools, config, context.workspace,
         sandbox_mode=options.sandbox_mode,
         allow_full_access=allow_full_access,
@@ -235,7 +250,8 @@ async def prepare_tools(resources: SessionResources) -> None:
         skill_runtime_context=runtime_context, skill_loader=resources.skill_loader,
         skill_access_filter=host.skill_access_filter,
         env_context=resources.state.get("env_context"),
-        session_mode=options.session_mode,
+        **(dict(session_mode=options.session_mode)
+           if _accepts_keyword(workspace_tools_factory, "session_mode") else {}),
         capability_state_provider=host.capability_state_provider or (lambda: (
             "loading" if resources.mcp_task is not None and not resources.mcp_task.done()
             else "ready"

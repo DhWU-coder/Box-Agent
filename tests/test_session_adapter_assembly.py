@@ -72,6 +72,58 @@ async def test_shared_assembly_passes_session_mode_to_workspace_tools(tmp_path):
         assert "已知文件路径" in session.agent.system_prompt
         assert "开放式项目分析" in session.agent.system_prompt
         assert "截断或超时" in session.agent.system_prompt
+        assert "find . -mindepth 1 -maxdepth 1 -print" in session.agent.system_prompt
+        assert "Get-ChildItem -Name" in session.agent.system_prompt
+    finally:
+        await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shared_assembly_keeps_legacy_workspace_tools_factories_working(tmp_path):
+    from box_agent.agent_session import AgentSession
+    from box_agent.session_context import HostBindings, SessionOptions
+
+    calls = []
+
+    def legacy_workspace_tools(
+        tools, config, workspace_dir, *, sandbox_mode=None, allow_full_access=False,
+        non_interactive=False, output=None, llm=None, permission_engine=None,
+        skill_runtime_context=None, skill_loader=None, skill_access_filter=None,
+        env_context=None, capability_state_provider=None,
+    ):
+        calls.append(workspace_dir)
+        return None
+
+    config = Config(
+        llm=LLMConfig(api_key="test"),
+        agent=AgentConfig(
+            workspace_dir=str(tmp_path),
+            enable_memory=False,
+            enable_memory_extraction=False,
+        ),
+        tools=ToolsConfig(
+            enable_mcp=False,
+            enable_skills=False,
+            enable_file_tools=False,
+            enable_bash=False,
+            enable_sub_agent=False,
+        ),
+    )
+    session = await AgentSession.open(
+        config=config,
+        options=SessionOptions(
+            profile="cli",
+            workspace_dir=tmp_path,
+            session_mode="code_agent",
+        ),
+        host=HostBindings(
+            llm_client=DoneLLM(),
+            base_tools=[],
+            workspace_tools_factory=legacy_workspace_tools,
+        ),
+    )
+    try:
+        assert len(calls) == 1
     finally:
         await session.aclose()
 
