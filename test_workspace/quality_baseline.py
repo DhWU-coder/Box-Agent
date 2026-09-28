@@ -198,7 +198,14 @@ def evaluate_attempt(attempt: Path, spec: dict) -> dict:
             except (json.JSONDecodeError, BadZipFile, ElementTree.ParseError):
                 # Captured evidence is valid but the delivered artifact is malformed.
                 result["checks"].append(False)
-        result["quality"] = "passed" if all(result["checks"]) and run.get("acp_status") == "completed" else "failed"
+        state_matches = run.get("acp_status") == "completed"
+        if spec.get("expected_state") == "waiting_for_user":
+            metadata = run.get("response_metadata") or {}
+            state_matches = (run.get("acp_status") == "incomplete"
+                             and metadata.get("ok") is True
+                             and metadata.get("runStatus") == "waiting_for_user"
+                             and metadata.get("lastStopReason") == "waiting_for_user")
+        result["quality"] = "passed" if all(result["checks"]) and state_matches else "failed"
     except (OSError, ValueError, KeyError, TypeError, IndexError, BadZipFile, ElementTree.ParseError) as error:
         result["reason"] = f"invalid evidence: {type(error).__name__}"
     return result

@@ -85,6 +85,7 @@
     {
       "id": "q0-wait",
       "split": "holdout",
+      "expected_state": "waiting_for_user",
       "checks": [
         {
           "kind": "tool",

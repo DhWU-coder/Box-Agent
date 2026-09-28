@@ -46,6 +46,6 @@ T1–T6 已完成实现和直接验收。T6 当时的全量失败保留在历史
 - [T10 桌面场景联调](T10-desktop-scenarios.md)，提交 `264a528`：真实开发客户端 IPC/ACP 八场景及六个自动 stdio 回归通过。测试启动配置引发的 `connectors:get-states` 错误已修复，普通开发实例已恢复并重启到最终源码。
 - [T11 兼容审查](T11-compatibility-review.md)：前端无需为本轮新增 ACP 字段；SDK 消费模式、严格序列化调用方和自定义委派工具的迁移条件分别列出。前端自身旧测试失败没有计入 Box-Agent 的通过结果。
 - [T12 显式工具去重](T12-explicit-tool-deduplication.md)：默认逐次执行，仅可信工具显式允许时批内合并；更新请求快照、Hook 和迁移契约。完整门禁 **5730 passed、318 skipped、1 deselected、0 failed**，编译及 wheel/sdist 构建通过；本项未安装或重启客户端。
-- [T13 最小质量基线](T13-minimal-quality-baseline.md)：System／Tool 现状、七个合成任务、ACP 评估与独立验收入口；确定性验证通过，真实模型首轮登录预检失败，质量结果未验证。
+- [T13 最小质量基线](T13-minimal-quality-baseline.md)，提交 `a8b9f49`：System／Tool 现状、七个合成任务、ACP 评估与独立验收入口；[T13a](T13a-profile-trace-capture.md) 记录登录恢复后的评估入口修复和首轮真实结果（5 通过、2 失败），不代表已有优化收益。
 
 当前达到源码、测试、Python 分发包、开发客户端重启/健康探针与确定性场景验证。尚未构建/安装本次 standalone runtime 或正式桌面包，也未在正式包上完成新真实用户任务；下一发布环节沿用原打包流程，必须更新实际携带的 runtime。

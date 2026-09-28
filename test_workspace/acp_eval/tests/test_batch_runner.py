@@ -96,7 +96,7 @@ def make_fake_repo(root: Path, mode: str = "normal") -> Path:
     dynamic_fake.write_text(
         fake_path.read_text(encoding="utf-8").replace(
             'f"eval-acp-{mode}-turn-1"',
-            'f"{upstream_session_id}-turn-1"',
+            'prompt["params"]["_meta"]["turnId"]',
         ),
         encoding="utf-8",
     )

@@ -1,5 +1,7 @@
 # T13：P0-Q0 最小任务基线与现状清单
 
+后续状态：T13 已提交为 `a8b9f49`。登录恢复后的入口修复与首轮七例真实结果见 [T13a](T13a-profile-trace-capture.md)；下方保留首次登录失败的历史记录。
+
 ## 修改方案
 
 基于 `2f6501b`，在 `feat/shared-agent-runtime` 上实施。

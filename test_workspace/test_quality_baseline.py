@@ -95,6 +95,22 @@ def test_incomplete_capture_cannot_pass(attempt):
     assert baseline.evaluate_attempt(attempt, completion_spec())["quality"] == "unverified"
 
 
+@pytest.mark.parametrize("reason,ok,expected", [
+    ("waiting_for_user", True, "passed"), ("max_steps", True, "failed"),
+    ("waiting_for_user", False, "failed"),
+])
+def test_expected_wait_requires_successful_waiting_metadata(attempt, reason, ok, expected):
+    write_json(attempt / "workspace/result.json", 391)
+    run = baseline.read_json(attempt / "run.json")
+    run.update(acp_status="incomplete", response_metadata={
+        "ok": ok, "runStatus": reason, "lastStopReason": reason,
+    })
+    write_json(attempt / "run.json", run)
+    spec = {**completion_spec(), "expected_state": "waiting_for_user"}
+    assert baseline.evaluate_attempt(attempt, spec)["quality"] == expected
+    assert baseline.evaluate_attempt(attempt, completion_spec())["quality"] == "failed"
+
+
 def test_path_escape_is_rejected(attempt):
     with pytest.raises(ValueError, match="escapes"):
         baseline.contained(attempt, "../secret")
