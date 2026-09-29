@@ -521,7 +521,10 @@ def _build_action_hints_prompt(config, memory, env_context: EnvContext | None = 
             if _host_mcp
             else state_path("config/mcp.json")
         )
-        mcp_path = _user_mcp if _user_mcp.exists() else Config.find_config_file(config.tools.mcp_config_path)
+        # A host may provide only system/connector files before creating mcp.json.
+        mcp_path = _user_mcp if _user_mcp.exists() else (
+            Config.find_config_file(config.tools.mcp_config_path) or _user_mcp
+        )
     except Exception:
         mcp_path = None
     playwright_unavailable = is_playwright_unavailable(
