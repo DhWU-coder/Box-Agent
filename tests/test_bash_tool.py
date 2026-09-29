@@ -1332,6 +1332,26 @@ def test_description_uses_injected_python_and_reserved_scratch_directory():
     assert '"${BOX_AGENT_PYTHON:-python3}" -u -m http.server' not in description
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_description_prefers_dedicated_search_tools_over_shell_search(
+    monkeypatch, windows
+):
+    monkeypatch.setattr(
+        bash_tool_module.platform, "system", lambda: "Windows" if windows else "Linux"
+    )
+    monkeypatch.setattr(bash_tool_module, "bundled_win_bash", lambda: None)
+    description = BashTool().description
+
+    assert "use glob/grep when available or search_files" in description
+    assert "Use bash rg only for specialized operations" in description
+    assert "Do NOT use grep/rg/find/ls" not in description
+    expected_listing = (
+        "Get-ChildItem -Name" if windows else "find . -mindepth 1 -maxdepth 1 -print"
+    )
+    assert expected_listing in description
+    assert "Do NOT use grep/find/ls to search or list files" not in description
+
+
 @pytest.mark.asyncio
 async def test_malformed_runtime_fallback_fails_without_approval():
     tool = BashTool(runtime_env={"BOX_AGENT_PYTHON": "/runtime/python"})
