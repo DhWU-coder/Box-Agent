@@ -161,16 +161,48 @@ async def test_acp_cancel_wakes_producer_while_host_send_is_blocked(tmp_path, mo
 
 @pytest.mark.asyncio
 async def test_acp_send_failure_does_not_return_normal_completion(tmp_path, monkeypatch):
+    send_error = TimeoutError("simulated host send timeout")
     class FailedConn(DummyConn):
         async def sessionUpdate(self, payload):
             if getattr(payload.update, "sessionUpdate", "") == "agent_message_chunk":
-                raise TimeoutError("simulated host send timeout")
+                raise send_error
             await super().sessionUpdate(payload)
 
     adapter, request = await make_adapter(tmp_path, monkeypatch, BurstKernel, FailedConn(), max_events=1)
     try:
-        with pytest.raises(TimeoutError, match="ACP session update timed out"):
+        with pytest.raises(TimeoutError) as caught:
             await asyncio.wait_for(adapter.prompt(request), 5)
+        # Python 3.11 aliases asyncio.TimeoutError to the built-in class, so
+        # _send wraps this error there; 3.10 propagates the original instance.
+        if asyncio.TimeoutError is TimeoutError:
+            assert caught.value.__cause__ is send_error
+            assert str(caught.value).startswith("ACP session update timed out after ")
+        else:
+            assert caught.value is send_error
+        assert not adapter._sessions[request.sessionId]._run_handle.is_active
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_blocked_send_times_out_and_stops_run(tmp_path, monkeypatch):
+    send_cancelled = asyncio.Event()
+
+    class BlockedConn(DummyConn):
+        async def sessionUpdate(self, payload):
+            if getattr(payload.update, "sessionUpdate", "") == "agent_message_chunk":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    send_cancelled.set()
+            await super().sessionUpdate(payload)
+
+    adapter, request = await make_adapter(tmp_path, monkeypatch, BurstKernel, BlockedConn(), max_events=1)
+    monkeypatch.setattr(adapter, "_SESSION_UPDATE_TIMEOUT_SECONDS", 0.05)
+    try:
+        with pytest.raises(TimeoutError, match="ACP session update timed out after 0.05s"):
+            await asyncio.wait_for(adapter.prompt(request), 5)
+        assert send_cancelled.is_set()
         assert not adapter._sessions[request.sessionId]._run_handle.is_active
     finally:
         await adapter.aclose()

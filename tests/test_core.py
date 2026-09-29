@@ -5470,15 +5470,20 @@ async def test_browser_snapshot_relative_filename_cannot_escape_session_cwd(tmp_
     assert "BROWSER_SNAPSHOT_OUTPUT_PATH_INVALID" in (result.error or "")
 
 
-def test_artifact_detect_spreadsheet_kind(tmp_path):
-    """CSV under a cwd child directory is classified as a spreadsheet."""
+@pytest.mark.parametrize("mime,kind", [
+    ("text/csv", "data"),
+    ("application/vnd.ms-excel", "spreadsheet"),
+])
+def test_artifact_detect_csv_kind_from_mime(tmp_path, monkeypatch, mime, kind):
+    """Classification follows the detected MIME independently of host mappings."""
+    monkeypatch.setattr(mimetypes, "guess_type", lambda *args, **kwargs: (mime, None))
     out = tmp_path / "output"
     out.mkdir()
     (out / "results.csv").write_text("a,b\n1,2")
     arts = _detect_artifacts("t2", "jupyter", "Saved to [output/results.csv]", str(tmp_path))
     assert len(arts) == 1
-    assert arts[0].kind == "spreadsheet"
-    assert arts[0].mime == mimetypes.guess_type("results.csv")[0]
+    assert arts[0].kind == kind
+    assert arts[0].mime == mime
     assert Path(arts[0].rel_path) == Path("output/results.csv")
 
 

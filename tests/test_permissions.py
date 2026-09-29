@@ -184,12 +184,14 @@ class TestFilesystemRead:
         decision = eng.check(FILESYSTEM_READ, {"path": str(fake_sibling)})
         assert decision.allowed is False
 
-    def test_symlink_outside_workspace_denied(self, engine: PermissionEngine, workspace: Path):
+    @pytest.mark.parametrize("inside_home", [True, False], ids=["home-escalation", "outside-home-denied"])
+    def test_symlink_outside_workspace_denied(self, engine: PermissionEngine, workspace: Path, inside_home):
         """A directory symlink cannot grant access to an existing outside file."""
         import os
         engine._app_read_dirs = ()
         outside = workspace.parent / "outside"
         outside.mkdir()
+        engine._home_dir = outside.resolve() if inside_home else (workspace.parent / "isolated-home").resolve()
         (outside / "passwd").write_text("private fixture", encoding="utf-8")
         target = workspace / "link_to_etc"
         try:
@@ -198,8 +200,15 @@ class TestFilesystemRead:
             pytest.skip("Cannot create symlink in this environment")
         decision = engine.check(FILESYSTEM_READ, {"path": str(target / "passwd")})
         assert decision.allowed is False
-        assert decision.permission_request is not None
-        assert decision.permission_request["path"] == str(target / "passwd")
+        # Explicit Windows drive paths support host directory approval even
+        # outside home; POSIX paths outside home have no escalation route.
+        if inside_home or os.name == "nt":
+            assert decision.permission_request is not None
+            assert decision.permission_request["requested_scope"] == "user_home"
+            assert decision.permission_request["path"] == str(target / "passwd")
+        else:
+            assert decision.permission_request is None
+            assert "outside all allowed scopes" in decision.reason
 
     def test_read_application_dir_allowed(self, engine: PermissionEngine):
         """Read-only probing of app/executable install roots is allowed."""
