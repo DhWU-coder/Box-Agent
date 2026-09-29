@@ -6096,6 +6096,10 @@ async def test_acp_can_cancel_pending_injected_message(tmp_path):
     assert injected == {"ok": True, "injectionId": "inj-2"}
     assert cancelled == {"ok": True}
     assert state.inject_queue.empty()
+    assert await agent.extMethod("inject", {
+        "sessionId": session.sessionId, "text": "改成5页", "injectionId": "inj-2",
+    }) == {"ok": True, "injectionId": "inj-2"}
+    assert state.inject_queue.qsize() == 1
 
 
 @pytest.mark.asyncio
@@ -6132,14 +6136,15 @@ async def test_acp_inject_same_id_is_idempotent(tmp_path):
     assert third == {"ok": True, "injectionId": "dup-1", "deduplicated": True}
     assert state.inject_queue.empty()
 
-    # An explicit cancel clears the id so the host may deliberately re-inject it.
-    await agent.extMethod(
+    # Cancelling consumed input cannot make a network retry run it twice.
+    cancelled = await agent.extMethod(
         "cancel_inject",
         {"sessionId": session.sessionId, "injectionId": "dup-1"},
     )
+    assert cancelled == {"ok": False}
     fourth = await agent.extMethod("inject", dict(args))
-    assert fourth == {"ok": True, "injectionId": "dup-1"}
-    assert state.inject_queue.qsize() == 1
+    assert fourth == {"ok": True, "injectionId": "dup-1", "deduplicated": True}
+    assert state.inject_queue.empty()
 
 
 @pytest.mark.asyncio

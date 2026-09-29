@@ -47,6 +47,23 @@ class _FakeSession:
 
 
 @pytest.mark.asyncio
+async def test_shared_run_commands_use_the_same_injection_deduplication():
+    from box_agent.injections import InjectionManager
+
+    session = _FakeSession()
+    session.inject_queue = InjectionManager()
+    handle = await AgentService().start(
+        RunRequest(run_id="run-1", session_id="session-1", user_message="work"),
+        session=session,
+    )
+    command = ControlCommand.inject_message("extra", injection_id="same-id")
+    await handle.send(command)
+    await handle.send(command)
+    assert session.inject_queue.qsize() == 1
+    await handle.result()
+
+
+@pytest.mark.asyncio
 async def test_agent_service_start_exposes_events_commands_and_result() -> None:
     session = _FakeSession()
     request = RunRequest(

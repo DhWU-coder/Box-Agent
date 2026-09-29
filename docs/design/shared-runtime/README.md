@@ -47,5 +47,6 @@ T1–T6 已完成实现和直接验收。T6 当时的全量失败保留在历史
 - [T11 兼容审查](T11-compatibility-review.md)：前端无需为本轮新增 ACP 字段；SDK 消费模式、严格序列化调用方和自定义委派工具的迁移条件分别列出。前端自身旧测试失败没有计入 Box-Agent 的通过结果。
 - [T12 显式工具去重](T12-explicit-tool-deduplication.md)：默认逐次执行，仅可信工具显式允许时批内合并；更新请求快照、Hook 和迁移契约。完整门禁 **5730 passed、318 skipped、1 deselected、0 failed**，编译及 wheel/sdist 构建通过；本项未安装或重启客户端。
 - [T13 最小质量基线](T13-minimal-quality-baseline.md)，提交 `a8b9f49`：System／Tool 现状、七个合成任务、ACP 评估与独立验收入口；[T13a](T13a-profile-trace-capture.md) 记录登录恢复后的评估入口修复和首轮真实结果（5 通过、2 失败），不代表已有优化收益。
+- [T14 注入信息管理](T14-runtime-instruction-provenance.md)：共享模块管理类型、来源、提示词、排队、去重、取消和注入回执；提前收尾策略单独验收。
 
 当前达到源码、测试、Python 分发包、开发客户端重启/健康探针与确定性场景验证。尚未构建/安装本次 standalone runtime 或正式桌面包，也未在正式包上完成新真实用户任务；下一发布环节沿用原打包流程，必须更新实际携带的 runtime。

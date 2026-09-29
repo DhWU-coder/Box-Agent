@@ -44,6 +44,7 @@ from .config import AgentConfig, ToolLimitsConfig
 from .llm import LLMClient
 from .logger import AgentLogger
 from .kernel.ports import KernelServices
+from .injections import InjectionManager
 from .runtime import run_agent_loop
 from .schema import Message
 from .session_log import SessionLog, SessionLogReplayError
@@ -528,7 +529,7 @@ class Agent:
         self.token_limit = token_limit
         self.workspace_dir = Path(workspace_dir)
         self.cancel_event: Optional[asyncio.Event] = None
-        self.inject_queue: asyncio.Queue[Any] = asyncio.Queue()
+        self.inject_queue: asyncio.Queue[Any] = InjectionManager()
         self._permission_negotiator = None  # set by CLI/ACP when permission engine is active
         self._proposal_negotiator = None  # set by CLI/ACP to handle MemoryProposalEvent
         self._hooks = hooks
@@ -1005,7 +1006,7 @@ class Agent:
         """Inject a user message into the running agent loop.
 
         The message is queued and will be appended to the conversation
-        at the next step boundary.  Safe to call from any thread.
+        at the next step boundary. Call on the agent's owning event loop.
         """
         self.inject_queue.put_nowait(content)
 
@@ -1222,6 +1223,14 @@ class Agent:
         )
         if effective_options.kernel_services is not None:
             run_arguments["kernel_services"] = effective_options.kernel_services
+        own_injections = (
+            self.inject_queue
+            if effective_options.inject_queue is self.inject_queue
+            and isinstance(self.inject_queue, InjectionManager)
+            else None
+        )
+        if own_injections is not None:
+            own_injections.begin_run()
         events = run_agent_loop(**run_arguments)
         try:
             async for event in events:
@@ -1335,6 +1344,8 @@ class Agent:
                 if callable(close):
                     await close()
             finally:
+                if own_injections is not None:
+                    own_injections.end_run()
                 if (
                     self.session_log is not None
                     and session_turn is not None

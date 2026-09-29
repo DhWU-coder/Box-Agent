@@ -65,6 +65,7 @@ from acp.schema import AgentCapabilities, Implementation, McpCapabilities
 from box_agent import __version__
 from box_agent.artifacts import is_intermediate_artifact
 from box_agent.agent_session import AgentSession
+from box_agent.injections import InjectionManager
 from box_agent.session_context import HostBindings, SessionOptions
 from box_agent.session_prompts import GENERAL_DIRECTORY_ORGANIZATION_PROMPT
 from box_agent.session_assembly import create_application_runtime
@@ -441,20 +442,6 @@ def _injected_marker(text: str, injection_id: str | None = None) -> str:
     if injection_id:
         return f"[Injected:{injection_id}] {text}"
     return f"[Injected] {text}"
-
-
-def _remove_inject_queue_item(queue: asyncio.Queue, injection_id: str) -> bool:
-    kept: list[Any] = []
-    removed = False
-    while not queue.empty():
-        item = queue.get_nowait()
-        if _inject_item_id(item) == injection_id:
-            removed = True
-            continue
-        kept.append(item)
-    for item in kept:
-        queue.put_nowait(item)
-    return removed
 
 
 def _meta_bool(meta: Any, *keys: str) -> bool:
@@ -972,7 +959,7 @@ class SessionState(AgentSession):
     trace_writer: SessionTraceWriter | None = None
     session_mode: str | None = None
     llm_binding: dict[str, Any] | None = None
-    seen_injection_ids: set[str] = field(default_factory=set)
+    inject_queue: InjectionManager = field(default_factory=InjectionManager)
     connector_skill_grants: set[str] = field(default_factory=set)
     selected_connector_ids: set[str] = field(default_factory=set)
     connector_statuses: tuple[tuple[str, str, str], ...] | None = None
@@ -2788,11 +2775,8 @@ class BoxACPAgent:
         state.agent.add_user_message(user_text)
 
         # Drain any stale injections from a previous turn
-        while not state.inject_queue.empty():
-            stale = state.inject_queue.get_nowait()
+        for stale in state.inject_queue.begin_run(discard_pending=True):
             log.warn("session/inject_stale", session_id=session_id, text=_inject_item_text(stale)[:80])
-        # Reset per-turn inject dedup — IDs are only meaningful within a turn.
-        state.seen_injection_ids.clear()
         skillhub_search_tool = state.agent.tools.get("search_skillhub")
         if isinstance(skillhub_search_tool, SkillHubSearchTool):
             skillhub_search_tool.reset_turn()
@@ -2900,6 +2884,7 @@ class BoxACPAgent:
             raise
         finally:
             state.turn_active = False
+            state.inject_queue.end_run()
             bash_tool = state.agent.tools.get("bash")
             write_tool = state.agent.tools.get("write_file")
 
@@ -3224,15 +3209,13 @@ class BoxACPAgent:
             # Idempotency: a host retrying after a lost/timed-out response with the
             # same injectionId must not enqueue (or re-run) the instruction twice.
             # Covers both still-pending and already-consumed items within the turn.
-            if injection_id in state.seen_injection_ids:
+            if not state.inject_queue.submit({"id": injection_id, "content": text}):
                 log.info(
                     "session/inject_dedup",
                     session_id=session_id,
                     injection_id=injection_id,
                 )
                 return {"ok": True, "injectionId": injection_id, "deduplicated": True}
-            state.seen_injection_ids.add(injection_id)
-            state.inject_queue.put_nowait({"id": injection_id, "content": text})
             log.info(
                 "session/inject",
                 session_id=session_id,
@@ -3248,9 +3231,7 @@ class BoxACPAgent:
                 return {"error": "session_not_found"}
             if not injection_id:
                 return {"error": "empty_injection_id"}
-            removed = _remove_inject_queue_item(state.inject_queue, injection_id)
-            # Allow the host to re-inject the same id after an explicit cancel.
-            state.seen_injection_ids.discard(injection_id)
+            removed = state.inject_queue.cancel(injection_id)
             log.info(
                 "session/inject_cancel",
                 session_id=session_id,

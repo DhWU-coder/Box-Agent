@@ -15,6 +15,7 @@ from .agent_service import AgentService
 from .config import Config
 from .events import AgentEvent, DoneEvent, StopReason
 from .execution_profile import ExecutionProfile
+from .injections import InjectionManager
 
 if TYPE_CHECKING:
     from .plugins.runtime import PluginRuntime, PluginSession
@@ -50,7 +51,7 @@ class AgentSession:
     permission_engine: PermissionEngine | None = None
     grant_store: GrantStore | None = None
     memory_extractor: Any | None = None
-    inject_queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
+    inject_queue: asyncio.Queue[Any] = field(default_factory=InjectionManager)
     turn_active: bool = False
     memory_block: str | None = None
     thinking_enabled: bool = False
@@ -277,6 +278,8 @@ class AgentSession:
         self._run_driving = True
         self._external_run_cleanup = None
         enclosing_turn_active = self.turn_active
+        if not enclosing_turn_active and isinstance(self.inject_queue, InjectionManager):
+            self.inject_queue.begin_run()
         self.turn_active = True
         self.agent.last_stop_reason = None
         events = None
@@ -347,6 +350,8 @@ class AgentSession:
                     finished.set_result(None)
                 # ACP can own a wider prompt spanning several continuation runs.
                 self.turn_active = enclosing_turn_active
+                if not enclosing_turn_active and isinstance(self.inject_queue, InjectionManager):
+                    self.inject_queue.end_run()
             if errors:
                 cleanup_error = _combined_cleanup_error(errors)
                 if primary_error is None:

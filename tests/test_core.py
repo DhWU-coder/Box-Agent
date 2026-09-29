@@ -1353,6 +1353,31 @@ async def test_force_plan_start_snapshot_not_emitted_without_plan_tool():
 
 
 @pytest.mark.asyncio
+async def test_plan_retry_preserves_original_user_request():
+    from box_agent.kernel.loop import _latest_user_text
+
+    llm = CapturingStreamLLM([
+        LLMResponse(content="Preparing the plan.", finish_reason="stop"),
+        LLMResponse(content="", finish_reason="tool", tool_calls=[
+            ToolCall(id="plan-retry", type="function", function=FunctionCall(
+                name="plan_write", arguments={"action": "set", "title": "Plan"},
+            )),
+        ]),
+        LLMResponse(content="done", finish_reason="stop"),
+    ])
+    await collect(run_agent_loop(
+        llm=llm, messages=_task_msgs(), tools={"plan_write": PlanWriteStubTool()},
+        max_steps=5, force_plan_start=True,
+    ))
+    request = llm.message_calls[1]
+    feedback = [message for message in request if message.source == "runtime"]
+    assert len(feedback) == 2
+    assert all("Runtime state update:" in message.content for message in feedback)
+    assert all("The user sent" not in message.content for message in feedback)
+    assert _latest_user_text(request) == _latest_user_text(_task_msgs())
+
+
+@pytest.mark.asyncio
 async def test_require_plan_approval_blocks_non_plan_tools_and_marks_plan_pending():
     llm = MockLLM(
         [
@@ -5845,6 +5870,12 @@ async def test_provider_stale_with_partial_content_resumes_once(tmp_path):
     assert injected_messages[0].user_visible is False
     assert "从未完成的动作继续" in injected_messages[0].content
     assert "5,500" in injected_messages[0].content
+    feedback = next(message for message in msgs if "从未完成的动作继续" in str(message.content))
+    assert feedback.source == "runtime"
+    assert "Runtime state update:" in feedback.content
+    assert "The user sent" not in feedback.content
+    from box_agent.kernel.loop import _latest_user_text
+    assert _latest_user_text(msgs) == "hi"
 
 
 @pytest.mark.asyncio
