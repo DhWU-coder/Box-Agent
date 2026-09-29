@@ -7,11 +7,11 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from time import monotonic
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from ..retry import RetryConfig, StreamInterrupted, async_retry, is_retryable_stream_error
 from ..schema import FunctionCall, LLMResponse, Message, StreamEvent, TokenUsage, ToolCall
@@ -126,6 +126,15 @@ def _apply_thinking_params(
 ) -> None:
     """Map the session deep-think flag to the provider request dialect."""
     normalized_model = (model or "").strip().casefold()
+    if (
+        re.search(r"(?:^|/)gpt-6-(?:sol|luna)(?:$|[-/:])", normalized_model)
+        and any(tool.get("type") == "function" for tool in params.get("tools", []))
+    ):
+        # These models require Responses for reasoning with tools. Chat
+        # Completions must explicitly disable reasoning, even when the user
+        # left thinking off, because the provider defaults to medium.
+        params["reasoning_effort"] = "none"
+        return
     if re.search(r"(?:^|/)(?:sn-)?kimi-k3(?:$|[-:])", normalized_model):
         params["reasoning_effort"] = "high" if thinking_enabled else "low"
         return
@@ -530,7 +539,7 @@ class OpenAIClient(LLMClientBase):
             api_base: Base URL for the API
             model: Model name to use
             retry_config: Optional retry configuration
-            max_output_tokens: Per-request ``max_tokens`` value sent to the API.
+            max_output_tokens: Per-request output-token limit sent to the API.
             auth_token: Optional in-memory product login token.
             auth_file: Optional auth.json path read before every request.
             timeout: Wall-clock cap (seconds) for each request to the API.
@@ -555,6 +564,7 @@ class OpenAIClient(LLMClientBase):
         # room to finish tool-call JSON, then it clears itself after the
         # next generate/generate_stream call.
         self._ephemeral_max_output_tokens: int | None = None
+        self._max_completion_token_bindings: set[tuple[str, str]] = set()
         if reasoning_effort_when_disabled not in (None, "none", "low"):
             raise ValueError("reasoning_effort_when_disabled must be null, 'none' or 'low'")
         self.reasoning_effort_when_disabled = reasoning_effort_when_disabled
@@ -582,7 +592,7 @@ class OpenAIClient(LLMClientBase):
         return prepared
 
     def set_ephemeral_max_output_tokens(self, value: int | None) -> None:
-        """Override ``max_tokens`` for the very next request.
+        """Override the output-token limit for the very next request.
 
         Cleared automatically after the next ``generate`` / ``generate_stream``
         completes so the boost never leaks into unrelated turns.
@@ -597,6 +607,35 @@ class OpenAIClient(LLMClientBase):
         if cap is not None:
             return max(cap, self.max_output_tokens)
         return self.max_output_tokens
+
+    async def _call_with_token_limit_fallback(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+        params: dict[str, Any],
+    ) -> Any:
+        """Retry an explicit token-parameter rejection once, before any output."""
+        binding = (self.api_base, params.get("model", ""))
+        known_bindings = getattr(self, "_max_completion_token_bindings", set())
+        if binding in known_bindings and "max_tokens" in params:
+            params["max_completion_tokens"] = params.pop("max_tokens")
+        try:
+            return await operation()
+        except BadRequestError as exc:
+            if not (
+                exc.code == "unsupported_parameter"
+                and exc.param == "max_tokens"
+                and "max_completion_tokens" in exc.message
+                and "max_tokens" in params
+            ):
+                raise
+
+        # Keep the same budget, including a one-shot truncation recovery boost.
+        params["max_completion_tokens"] = params.pop("max_tokens")
+        response = await operation()
+        self._max_completion_token_bindings = (
+            getattr(self, "_max_completion_token_bindings", set()) | {binding}
+        )
+        return response
 
     async def _make_api_request(
         self,
@@ -673,7 +712,9 @@ class OpenAIClient(LLMClientBase):
 
             # Return full response to access usage info
             return response
-        return await self._call_with_hosted_auth_retry(_once)
+        return await self._call_with_token_limit_fallback(
+            lambda: self._call_with_hosted_auth_retry(_once), params,
+        )
 
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
@@ -1027,7 +1068,6 @@ class OpenAIClient(LLMClientBase):
             params["extra_headers"] = auth_headers
 
         params = await self._bound_request_body(params, turn_id=turn_id)
-        log_llm_request(provider="openai", mode="stream", api_base=self.api_base, params=params)
 
         # Accumulators
         text_content = ""
@@ -1055,6 +1095,7 @@ class OpenAIClient(LLMClientBase):
                 )
                 if auth_headers:
                     params["extra_headers"] = auth_headers
+                log_llm_request(provider="openai", mode="stream", api_base=self.api_base, params=params)
                 try:
                     raw_response = await _await_if_needed(
                         self.client.chat.completions.with_raw_response.create(**params)
@@ -1072,7 +1113,9 @@ class OpenAIClient(LLMClientBase):
                 except AttributeError:
                     return await _await_if_needed(self.client.chat.completions.create(**params))
 
-            return await self._call_with_hosted_auth_retry(_once)
+            return await self._call_with_token_limit_fallback(
+                lambda: self._call_with_hosted_auth_retry(_once), params,
+            )
 
         import asyncio as _asyncio
 
