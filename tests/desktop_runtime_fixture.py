@@ -1,0 +1,215 @@
+"""Opt-in deterministic ACP server for a development desktop, never a release entry."""
+
+import asyncio
+from contextvars import ContextVar
+import json
+import os
+from pathlib import Path
+import re
+
+from box_agent.agent_service import AgentService
+from box_agent.api import RunDeliveryOptions
+from box_agent.config import AgentConfig, Config, LLMConfig, ToolsConfig
+from box_agent.schema import FunctionCall, LLMResponse, StreamEvent, ToolCall
+from box_agent.tools.base import Tool, ToolResult
+from box_agent.tools.delegated_budget import DelegatedBudget, bind_budgets, current_budgets
+from box_agent.tools.engine.execution import invoke_tool_once
+
+
+scenario = ContextVar("desktop_test_scenario", default="normal")
+executions = ContextVar("desktop_test_executions", default=None)
+
+
+class CountTool(Tool):
+    name = "fixture_count"
+    description = "Record a synthetic test execution; no external side effects."
+    parallel_safe = True
+    parameters = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
+
+    async def execute(self, n):
+        executions.get().append({"tool": self.name, "n": n})
+        await asyncio.sleep(0)
+        return ToolResult(success=True, content=f"counted {n}")
+
+
+class NestedTool(CountTool):
+    name = "fixture_nested"
+
+    async def execute(self, n):
+        await super().execute(n)
+        inner = DelegatedBudget(1)
+        with bind_budgets((*current_budgets(), inner)):
+            results = [await invoke_tool_once(CountTool(), {"n": n * 10 + index}) for index in range(3)]
+        return ToolResult(success=True, content=json.dumps({"inner_used": inner.used,
+                                                          "executed": sum(r.success for r in results)}))
+
+
+class PermissionTool(Tool):
+    name = "fixture_permission"
+    description = "Request host approval for a synthetic test operation."
+    parameters = {"type": "object", "properties": {}}
+    approved = False
+
+    def approve_permission_request(self, request):
+        self.approved = True
+
+    async def execute(self):
+        if not self.approved:
+            return ToolResult(success=False, permission_request={
+                "scope": "safety", "requested_scope": "dangerous_command",
+                "command": "fixture-permission", "reason": "Desktop regression: no real command executes",
+                "temporary_supported": True, "persistent_supported": False,
+            })
+        executions.get().append({"tool": self.name})
+        self.approved = False
+        return ToolResult(success=True, content="fixture approved")
+
+
+def call(name, arguments, index):
+    return ToolCall(id=f"fixture-{name}-{index}", type="function",
+                    function=FunctionCall(name=name, arguments=arguments))
+
+
+class FixtureLLM:
+    model = "desktop-fixture"
+
+    def __init__(self, **kwargs):
+        pass
+
+    def for_model(self, *args, **kwargs):
+        return self
+
+    async def generate(self, *args, **kwargs):
+        return LLMResponse(content='{"continue": false}', finish_reason="stop")
+
+    async def generate_stream(self, messages, tools=None, **kwargs):
+        users = "\n".join(str(message.content) for message in messages if message.role == "user")
+        has_results = any(message.role == "tool" for message in messages)
+        mode = scenario.get()
+        if "fixture-leaf" in users and not has_results:
+            name = "fixture_nested" if mode == "nested" else "fixture_count"
+            leaf = int(re.search(r"fixture-leaf (\d+)", users)[1])
+            yield StreamEvent(type="finish", finish_reason="tool_use", tool_calls=[
+                call(name, {"n": leaf * 10 + index}, index)
+                for index in range(1 if mode == "nested" else 4)
+            ])
+            return
+        if not has_results and mode in {"budget", "nested"}:
+            required = "fixture_nested" if mode == "nested" else "fixture_count"
+            yield StreamEvent(type="finish", finish_reason="tool_use", tool_calls=[
+                call("sub_agent", {"task": f"fixture-leaf {index}", "required_tools": [required]}, index)
+                for index in range(2)
+            ])
+            return
+        if not has_results and mode.startswith("permission"):
+            yield StreamEvent(type="finish", finish_reason="tool_use",
+                              tool_calls=[call("fixture_permission", {}, 0)])
+            return
+        if mode == "oversize":
+            yield StreamEvent(type="text", delta="x" * 70000)
+        elif mode in {"slow", "timeout"}:
+            for index in range(40):
+                yield StreamEvent(type="text", delta=f"piece-{index};")
+        else:
+            yield StreamEvent(type="text", delta=json.dumps({"fixture": mode, "executions": executions.get()}))
+        yield StreamEvent(type="finish", finish_reason="stop")
+
+
+class SmallService(AgentService):
+    async def start(self, *args, **kwargs):
+        kwargs["delivery_options"] = RunDeliveryOptions(max_events=2, max_bytes=65536,
+                                                       congestion_timeout_seconds=0.25)
+        return await super().start(*args, **kwargs)
+
+
+def install_fixture(acp, root):
+    from box_agent.tools.sub_agent_capabilities import BUILTIN_TOOL_CAPABILITIES, ToolCapabilityMetadata
+
+    for name in ("fixture_count", "fixture_nested"):
+        BUILTIN_TOOL_CAPABILITIES[name] = ToolCapabilityMetadata(read=True)
+
+    class Connection:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        async def sessionUpdate(self, payload):
+            if getattr(payload.update, "sessionUpdate", "") == "agent_message_chunk":
+                await asyncio.sleep({"slow": 0.01, "timeout": 1}.get(scenario.get(), 0))
+            return await self.wrapped.sessionUpdate(payload)
+
+    original = acp.BoxACPAgent
+
+    class Adapter(original):
+        def __init__(self, conn, *args, **kwargs):
+            super().__init__(Connection(conn), *args, **kwargs)
+
+        def _llm_for_binding(self, binding):
+            # Host bindings are retained on the session, but this opt-in test
+            # process never loads credentials or contacts a real provider.
+            return self._llm
+
+        async def prompt(self, params):
+            text = " ".join(str(getattr(block, "text", block.get("text", "") if isinstance(block, dict) else ""))
+                            for block in params.prompt)
+            match = re.search(r"fixture:(\w+)", text)
+            mode = match[1] if match else "normal"
+            token = scenario.set(mode)
+            calls_token = executions.set([])
+            try:
+                return await super().prompt(params)
+            finally:
+                state = self._sessions.get(params.sessionId)
+                handle = getattr(state, "_run_handle", None)
+                if handle is not None and not handle.is_active:
+                    result = await handle.result()
+                    record = {"scenario": mode, "session_id": params.sessionId,
+                              "status": result.status.value, "stop_reason": result.stop_reason,
+                              "error": dict(result.error) if result.error else None,
+                              "executions": executions.get()}
+                    with (root / "results.jsonl").open("a", encoding="utf-8") as output:
+                        output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                scenario.reset(token)
+                executions.reset(calls_token)
+
+    async def tools(*args, **kwargs):
+        return [CountTool(), NestedTool(), PermissionTool()], None, None, None
+
+    acp.LLMClient = FixtureLLM
+    acp.initialize_base_tools = tools
+    acp.AgentService = SmallService
+    acp.BoxACPAgent = Adapter
+
+
+def main():
+    raw = os.environ.get("BOX_AGENT_DESKTOP_TEST_ROOT")
+    if not raw:
+        raise RuntimeError("This test entry requires BOX_AGENT_DESKTOP_TEST_ROOT")
+    root = Path(raw).resolve()
+    workspace = Path(__file__).resolve().parents[1] / "workspace"
+    if not root.is_relative_to(workspace.resolve()):
+        raise RuntimeError("Desktop test state must stay inside repository workspace")
+    root.mkdir(parents=True, exist_ok=True)
+    os.environ["BOX_AGENT_HOME"] = str(root / "profile")
+    os.environ["BOX_AGENT_LOG_FILE"] = str(root / "profile/log/box-agent.log")
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root / "profile/browsers")
+    os.environ["BOX_AGENT_SESSION_TRACE_ENABLED"] = "0"
+    import box_agent.acp as acp
+
+    install_fixture(acp, root)
+    config = Config(
+        llm=LLMConfig(api_key="synthetic-test-key", model="desktop-fixture"),
+        agent=AgentConfig(workspace_dir=str(root / "profile/workspaces"), max_steps=5,
+                          enable_memory=False, enable_memory_extraction=False,
+                          memory_maintainer_enabled=False, memory_promotion_proposal_enabled=False),
+        tools=ToolsConfig(enable_file_tools=False, enable_bash=False, enable_todo=False,
+                          enable_plan=False, enable_sub_agent=True, enable_skills=False, enable_mcp=False),
+    )
+    config.tool_limits.general.max_delegated_tool_calls = 3
+    asyncio.run(acp.run_acp_server(config))
+
+
+if __name__ == "__main__":
+    main()

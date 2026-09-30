@@ -1392,6 +1392,7 @@ async def test_url_config_validation():
             assert tools == []
         finally:
             await cleanup_mcp_connections()
+            f.close()
             Path(f.name).unlink()
 
 
@@ -1416,6 +1417,7 @@ async def test_stdio_config_validation():
             assert tools == []
         finally:
             await cleanup_mcp_connections()
+            f.close()
             Path(f.name).unlink()
 
 
@@ -1439,6 +1441,7 @@ async def test_mixed_config_loading():
             assert tools == []
         finally:
             await cleanup_mcp_connections()
+            f.close()
             Path(f.name).unlink()
 
 
@@ -1640,6 +1643,7 @@ async def test_per_server_timeout_override_in_config():
 
         finally:
             await cleanup_mcp_connections()
+            f.close()
             Path(f.name).unlink()
 
 

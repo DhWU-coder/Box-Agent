@@ -256,6 +256,14 @@ class SubAgentTool(EventEmittingTool):
     aliases = ("sessions_spawn", "delegate_task")
 
     parallel_safe = True
+    supports_delegated_budget = True
+
+    async def _invoke_validated(self, arguments, *, context):
+        from .delegated_budget import bind_budgets, current_budgets
+
+        budgets = (context.child_budgets if context is not None else ()) or current_budgets()
+        with bind_budgets(budgets):
+            return await super()._invoke_validated(arguments, context=context)
 
     def __init__(
         self,

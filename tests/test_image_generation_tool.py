@@ -96,18 +96,18 @@ async def test_generate_image_saves_base64_response(
     assert result.raw_output["type"] == "artifact"
     assert result.raw_output["kind"] == "image"
     assert result.raw_output["filename"] == "hero.png"
-    assert result.raw_output["rel_path"] == "assets/generated/hero.png"
+    assert Path(result.raw_output["rel_path"]) == Path("assets/generated/hero.png")
     assert result.raw_output["abs_path"] == str(tmp_path / "assets/generated/hero.png")
     assert result.raw_output["uri"] == (tmp_path / "assets/generated/hero.png").as_uri()
     assert result.raw_output["mime"] == "image/png"
     assert result.raw_output["size_bytes"] == len(PNG_BYTES)
-    assert result.raw_output["path"] == "assets/generated/hero.png"
+    assert Path(result.raw_output["path"]) == Path("assets/generated/hero.png")
     assert result.raw_output["mime_type"] == "image/png"
     assert result.raw_output["width"] == 1536
     assert result.raw_output["height"] == 1024
     assert result.raw_output["size"] == "1536x1024"
     assert result.raw_output["requested_height"] == 900
-    assert "assets/generated/hero.png" in result.content
+    assert str(Path("assets/generated/hero.png")) in result.content
 
 
 @pytest.mark.asyncio
@@ -187,11 +187,11 @@ async def test_generate_image_saves_relative_paths_under_output_dir(
     assert result.success
     assert target.read_bytes() == PNG_BYTES
     assert not (tmp_path / "assets/generated/hero.png").exists()
-    assert result.raw_output["rel_path"] == "session-a/output/assets/generated/hero.png"
-    assert result.raw_output["artifact_rel_path"] == "assets/generated/hero.png"
-    assert result.raw_output["path"] == "assets/generated/hero.png"
+    assert Path(result.raw_output["rel_path"]) == Path("session-a/output/assets/generated/hero.png")
+    assert Path(result.raw_output["artifact_rel_path"]) == Path("assets/generated/hero.png")
+    assert Path(result.raw_output["path"]) == Path("assets/generated/hero.png")
     assert result.raw_output["abs_path"] == str(target)
-    assert "[assets/generated/hero.png]" in result.content
+    assert f"[{Path('assets/generated/hero.png')}]" in result.content
 
 
 @pytest.mark.asyncio
@@ -260,7 +260,7 @@ async def test_generate_image_accepts_explicit_size(
     assert result.success
     assert (tmp_path / "assets/generated/seasonal.png").read_bytes() == PNG_BYTES
     assert result.raw_output
-    assert result.raw_output["path"] == "assets/generated/seasonal.png"
+    assert Path(result.raw_output["path"]) == Path("assets/generated/seasonal.png")
     assert result.raw_output["size"] == "2048x2048"
     assert result.raw_output["width"] == 2048
     assert result.raw_output["height"] == 2048
@@ -593,7 +593,7 @@ async def test_generate_image_saves_direct_image_response(
     assert result.success
     assert (tmp_path / "assets/generated/direct.png").read_bytes() == PNG_BYTES
     assert result.raw_output
-    assert result.raw_output["path"] == "assets/generated/direct.png"
+    assert Path(result.raw_output["path"]) == Path("assets/generated/direct.png")
 
 
 @pytest.mark.asyncio
@@ -650,7 +650,7 @@ async def test_generate_image_accepts_minimax_image_base64_list_response(
     assert result.success
     assert (tmp_path / "assets/generated/minimax.jpg").read_bytes() == JPEG_BYTES
     assert result.raw_output
-    assert result.raw_output["path"] == "assets/generated/minimax.jpg"
+    assert Path(result.raw_output["path"]) == Path("assets/generated/minimax.jpg")
     assert result.raw_output["mime_type"] == "image/jpeg"
 
 

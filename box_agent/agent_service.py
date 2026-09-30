@@ -8,8 +8,8 @@ from typing import Any
 from .agent import Agent
 from .agent_runtime import AgentFactory, build_agent
 from .agent_run import AgentRunHandle
-from .api import RunRequest
-from .run_control import PermissionBroker, RunControl
+from .api import RunDeliveryOptions, RunRequest
+from .run_control import CancellablePermissionNegotiator, PermissionBroker, RunControl
 
 
 class AgentService:
@@ -48,6 +48,7 @@ class AgentService:
         *,
         session: Any,
         options: Any | None = None,
+        delivery_options: RunDeliveryOptions | None = None,
     ) -> AgentRunHandle:
         """Start one protocol-neutral run over an existing AgentSession.
 
@@ -84,8 +85,13 @@ class AgentService:
                 run_id=request.run_id,
                 grant_store=getattr(session, "grant_store", None),
             )
+        elif permission_broker is not None:
+            options = replace(options, permission_negotiator=CancellablePermissionNegotiator(
+                permission_broker, control,
+            ))
 
         handle = AgentRunHandle.for_run(
+            delivery_options=delivery_options,
             state=session,
             run_id=request.run_id,
             events_factory=lambda: session.run_events(options=options),

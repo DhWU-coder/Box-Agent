@@ -478,6 +478,7 @@ async def test_acp_session_metadata_hides_physically_isolated_connector_skills(t
 @pytest.mark.asyncio
 async def test_acp_workspace_config_methods_share_profiles(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     workspace = tmp_path / "project"
     workspace.mkdir()
     config = Config(
@@ -505,6 +506,7 @@ async def test_acp_workspace_config_methods_share_profiles(tmp_path, monkeypatch
 @pytest.mark.asyncio
 async def test_acp_uses_saved_code_type_when_host_omits_session_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     workspace = tmp_path / "project"
     workspace.mkdir()
     WorkspaceRegistry().set(workspace, "code")
@@ -1750,6 +1752,7 @@ async def test_acp_rejects_workspace_change_without_dropping_existing_session(
     monkeypatch,
 ):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     first_workspace = tmp_path / "first"
     second_workspace = tmp_path / "second"
     first_workspace.mkdir()
@@ -3251,6 +3254,7 @@ async def test_acp_binds_cumulative_real_user_text_to_bash_env(tmp_path):
     bash_env = agent._sessions[session.sessionId].agent.tools["bash"]._subprocess_env
     source_text = base64.b64decode(bash_env["BOX_AGENT_SOURCE_TEXT_B64"]).decode("utf-8")
     assert source_text == "原始事实 A\n\n补充事实 B"
+    await agent.aclose()
 
 
 @pytest.mark.asyncio
@@ -3658,6 +3662,7 @@ async def test_acp_skill_invocations_are_idempotent_and_keep_context(
     monkeypatch,
 ):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     skills_dir = tmp_path / "skills"
     skill_dir = skills_dir / "paid-skill"
     skill_dir.mkdir(parents=True)
@@ -3744,6 +3749,7 @@ async def test_acp_skill_invocations_are_idempotent_and_keep_context(
 @pytest.mark.asyncio
 async def test_acp_emits_turn_usage_for_tools_mcp_and_tokens(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     config = Config(
         llm=LLMConfig(api_key="test-key"),
         agent=AgentConfig(max_steps=3, workspace_dir=str(tmp_path)),
@@ -3806,6 +3812,7 @@ async def test_acp_emits_turn_usage_for_tools_mcp_and_tokens(tmp_path, monkeypat
 @pytest.mark.asyncio
 async def test_acp_threads_session_turn_and_title_to_llm(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     config = Config(
         llm=LLMConfig(api_key="test-key"),
         agent=AgentConfig(
@@ -4420,6 +4427,7 @@ async def test_acp_injects_standard_box_agent_image_generation_policy(tmp_path):
 @pytest.mark.asyncio
 async def test_acp_ignores_host_artifact_root_dir(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     monkeypatch.delenv("BOX_AGENT_WORKSPACE_DIR", raising=False)
     workspace = tmp_path / "session-a"
     workspace.mkdir()
@@ -4491,6 +4499,7 @@ async def test_acp_workspace_layout_prompt_ignores_legacy_roots(
     layout_keys,
 ):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     selected_root = tmp_path / "workbench"
     task_root = selected_root / "2026-08-31-task"
     artifact_root = task_root / "output" / "tasks" / "task-1"
@@ -5374,6 +5383,7 @@ async def test_acp_does_not_read_or_rewrite_legacy_external_skill_owner(
     monkeypatch,
 ):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     monkeypatch.setenv("BOX_AGENT_WORKFLOW_OWNER_DIR", str(tmp_path / "owners"))
     skills_dir = tmp_path / "skills"
     skill_dir = skills_dir / "ppt-master"
@@ -6086,6 +6096,10 @@ async def test_acp_can_cancel_pending_injected_message(tmp_path):
     assert injected == {"ok": True, "injectionId": "inj-2"}
     assert cancelled == {"ok": True}
     assert state.inject_queue.empty()
+    assert await agent.extMethod("inject", {
+        "sessionId": session.sessionId, "text": "改成5页", "injectionId": "inj-2",
+    }) == {"ok": True, "injectionId": "inj-2"}
+    assert state.inject_queue.qsize() == 1
 
 
 @pytest.mark.asyncio
@@ -6122,14 +6136,15 @@ async def test_acp_inject_same_id_is_idempotent(tmp_path):
     assert third == {"ok": True, "injectionId": "dup-1", "deduplicated": True}
     assert state.inject_queue.empty()
 
-    # An explicit cancel clears the id so the host may deliberately re-inject it.
-    await agent.extMethod(
+    # Cancelling consumed input cannot make a network retry run it twice.
+    cancelled = await agent.extMethod(
         "cancel_inject",
         {"sessionId": session.sessionId, "injectionId": "dup-1"},
     )
+    assert cancelled == {"ok": False}
     fourth = await agent.extMethod("inject", dict(args))
-    assert fourth == {"ok": True, "injectionId": "dup-1"}
-    assert state.inject_queue.qsize() == 1
+    assert fourth == {"ok": True, "injectionId": "dup-1", "deduplicated": True}
+    assert state.inject_queue.empty()
 
 
 @pytest.mark.asyncio
@@ -6487,7 +6502,7 @@ async def test_acp_full_access_skips_dangerous_command_approval(tmp_path, monkey
 async def test_acp_prompt_includes_skill_runtime_context(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     sandbox_base = tmp_path / "sandbox-runtime"
-    python_path = sandbox_base / "venv" / "bin" / "python"
+    python_path = sandbox_base / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     python_path.parent.mkdir(parents=True)
     python_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     python_path.chmod(0o755)
@@ -6578,7 +6593,7 @@ async def test_acp_prompt_and_bash_env_include_self_managed_node_runtime(tmp_pat
     assert bash_tool._subprocess_env["BOX_AGENT_NPX"] == str(npx)
     skill_tools = Path.home() / ".box-agent" / "skill-tools"
     assert bash_tool._subprocess_env["NODE_PATH"].split(os.pathsep) == [
-        str(skill_tools / "lib" / "node_modules"),
+        str(skill_tools / "node_modules" if os.name == "nt" else skill_tools / "lib" / "node_modules"),
         str(node_root / "sandbox" / "node_modules"),
     ]
     assert bash_tool._subprocess_env["NPM_CONFIG_CACHE"] == str(skill_tools / "npm-cache")
@@ -7550,6 +7565,7 @@ async def test_acp_prompt_binds_browser_session_key_to_session_id(tmp_path, monk
 @pytest.mark.asyncio
 async def test_acp_rebind_closes_retired_handles_browser_context(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     closed: list[str] = []
 
     async def fake_close(session_key: str) -> bool:

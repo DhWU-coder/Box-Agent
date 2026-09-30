@@ -25,6 +25,10 @@ cached summary is not design authority and must not be edited by hand.
 
 ## Design routing by changed area
 
+For a source-baselined assessment of the complete Agent harness, module
+tradeoffs, industry references, and optimization priorities, see
+[Harness design review (中文)](harness-review-cn.md).
+
 For an overall view of Tool and Skill ownership and execution, start with
 [Tool / Skill organization and workflow diagrams](tool-skill-workflows.md).
 
