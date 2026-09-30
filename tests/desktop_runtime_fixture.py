@@ -20,6 +20,12 @@ scenario = ContextVar("desktop_test_scenario", default="normal")
 executions = ContextVar("desktop_test_executions", default=None)
 
 
+def record_lifecycle(event, **details):
+    root = Path(os.environ["BOX_AGENT_DESKTOP_TEST_ROOT"])
+    with (root / "lifecycle.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps({"event": event, **details}) + "\n")
+
+
 class CountTool(Tool):
     name = "fixture_count"
     description = "Record a synthetic test execution; no external side effects."
@@ -82,6 +88,9 @@ class FixtureLLM:
     async def generate(self, *args, **kwargs):
         return LLMResponse(content='{"continue": false}', finish_reason="stop")
 
+    async def aclose(self):
+        record_lifecycle("llm_closed")
+
     async def generate_stream(self, messages, tools=None, **kwargs):
         users = "\n".join(str(message.content) for message in messages if message.role == "user")
         has_results = any(message.role == "tool" for message in messages)
@@ -105,8 +114,17 @@ class FixtureLLM:
             yield StreamEvent(type="finish", finish_reason="tool_use",
                               tool_calls=[call("fixture_permission", {}, 0)])
             return
+        if mode == "stream_wait":
+            try:
+                yield StreamEvent(type="text", delta="STREAM_WAIT_READY")
+                await asyncio.Event().wait()
+            finally:
+                record_lifecycle("stream_closed")
+            return
         if mode == "oversize":
             yield StreamEvent(type="text", delta="x" * 70000)
+        elif mode == "stdout_pressure":
+            yield StreamEvent(type="text", delta="x" * (512 * 1024))
         elif mode in {"slow", "timeout"}:
             for index in range(40):
                 yield StreamEvent(type="text", delta=f"piece-{index};")
@@ -117,13 +135,23 @@ class FixtureLLM:
 
 class SmallService(AgentService):
     async def start(self, *args, **kwargs):
-        kwargs["delivery_options"] = RunDeliveryOptions(max_events=2, max_bytes=65536,
-                                                       congestion_timeout_seconds=0.25)
+        kwargs["delivery_options"] = (
+            RunDeliveryOptions() if scenario.get() == "stdout_pressure"
+            else RunDeliveryOptions(max_events=2, max_bytes=65536, congestion_timeout_seconds=0.25)
+        )
         return await super().start(*args, **kwargs)
 
 
 def install_fixture(acp, root):
+    from box_agent.acp import stdio_compat
     from box_agent.tools.sub_agent_capabilities import BUILTIN_TOOL_CAPABILITIES, ToolCapabilityMetadata
+
+    class WriteProtocol(stdio_compat._WritePipeProtocol):
+        def pause_writing(self):
+            super().pause_writing()
+            (root / "stdout-paused").touch()
+
+    stdio_compat._WritePipeProtocol = WriteProtocol
 
     for name in ("fixture_count", "fixture_nested"):
         BUILTIN_TOOL_CAPABILITIES[name] = ToolCapabilityMetadata(read=True)
@@ -150,6 +178,13 @@ def install_fixture(acp, root):
             # Host bindings are retained on the session, but this opt-in test
             # process never loads credentials or contacts a real provider.
             return self._llm
+
+        async def aclose(self):
+            states = list(self._sessions.values())
+            await super().aclose()
+            record_lifecycle("adapter_closed", remaining_sessions=len(self._sessions),
+                             closed_sessions=all(state._closed for state in states),
+                             active_runs=sum(state.run_handle.is_active for state in states))
 
         async def prompt(self, params):
             text = " ".join(str(getattr(block, "text", block.get("text", "") if isinstance(block, dict) else ""))

@@ -33,7 +33,7 @@ import platform
 import re
 import signal
 import sys
-from contextlib import AsyncExitStack, aclosing
+from contextlib import AsyncExitStack, aclosing, suppress
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -5433,6 +5433,35 @@ class _MemoryProposalNegotiator:
             )
 
 
+async def _close_acp_connection(
+    connection: AgentSideConnection, writer: asyncio.StreamWriter, *, timeout: float = 1.0,
+) -> None:
+    """Allow final messages to drain, then stop a backpressured SDK sender.
+
+    Cancelling the SDK close interrupts its sender wait and lets it continue
+    cancelling request tasks. Aborting the pipe also discards buffered output
+    that a disconnected host may never read. No SDK private tasks are accessed.
+    """
+    closing = asyncio.create_task(connection.close())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=timeout)
+        if not done:
+            log.warn("server/stdio_close_timeout", timeout=timeout,
+                     message="Host is not draining stdout; aborting protocol output")
+            closing.cancel()
+            writer.transport.abort()
+            with suppress(asyncio.CancelledError):
+                await closing
+        else:
+            await closing
+    finally:
+        # If server shutdown itself is cancelled, retain ownership of this task.
+        if not closing.done():
+            closing.cancel()
+            writer.transport.abort()
+            await asyncio.gather(closing, return_exceptions=True)
+
+
 async def run_acp_server(config: Config | None = None) -> None:
     """Run Box-Agent as an ACP-compatible stdio server."""
     config = config or Config.load()
@@ -5475,6 +5504,7 @@ async def run_acp_server(config: Config | None = None) -> None:
         sys.stderr.flush()
 
     shutdown_event = asyncio.Event()
+    connection: AgentSideConnection | None = None
     server_adapter: BoxACPAgent | None = None
     llm = lite_llm = None
     mcp_task = skill_task = None
@@ -5572,7 +5602,7 @@ async def run_acp_server(config: Config | None = None) -> None:
 
         # Restore real stdout for ACP transport, then re-guard sys.stdout
         sys.stdout = _real_stdout
-        reader, writer = await stdio_streams_largebuf()
+        reader, writer = await stdio_streams_largebuf(on_eof=shutdown_event.set)
 
         # Windows fix: the ACP dependency's _StdoutTransport.write() resolves
         # sys.stdout.buffer dynamically at each call.  After re-guarding
@@ -5607,7 +5637,7 @@ async def run_acp_server(config: Config | None = None) -> None:
             )
             return server_adapter
 
-        AgentSideConnection(create_adapter, writer, reader)
+        connection = AgentSideConnection(create_adapter, writer, reader)
 
         log.info("server/ready", message="ACP server ready, listening on stdio")
         _stderr_print("✅ ACP protocol ready; MCP loading continues in background")
@@ -5650,7 +5680,11 @@ async def run_acp_server(config: Config | None = None) -> None:
                 for task in (mcp_task, skill_task):
                     if task is not None:
                         shutdown.push_async_callback(stop_background_task, task)
+                if connection is not None:
+                    shutdown.push_async_callback(_close_acp_connection, connection, writer)
                 if server_adapter is not None:
+                    # Settle owned runs while the SDK sender is still live:
+                    # prompt cancellation can emit final protocol updates.
                     shutdown.push_async_callback(server_adapter.aclose)
         except BaseException as cleanup_error:
             if primary_error is None:
