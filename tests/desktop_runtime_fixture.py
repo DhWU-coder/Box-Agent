@@ -123,6 +123,8 @@ class FixtureLLM:
             return
         if mode == "oversize":
             yield StreamEvent(type="text", delta="x" * 70000)
+        elif mode == "stdout_pressure":
+            yield StreamEvent(type="text", delta="x" * (512 * 1024))
         elif mode in {"slow", "timeout"}:
             for index in range(40):
                 yield StreamEvent(type="text", delta=f"piece-{index};")
@@ -133,13 +135,23 @@ class FixtureLLM:
 
 class SmallService(AgentService):
     async def start(self, *args, **kwargs):
-        kwargs["delivery_options"] = RunDeliveryOptions(max_events=2, max_bytes=65536,
-                                                       congestion_timeout_seconds=0.25)
+        kwargs["delivery_options"] = (
+            RunDeliveryOptions() if scenario.get() == "stdout_pressure"
+            else RunDeliveryOptions(max_events=2, max_bytes=65536, congestion_timeout_seconds=0.25)
+        )
         return await super().start(*args, **kwargs)
 
 
 def install_fixture(acp, root):
+    from box_agent.acp import stdio_compat
     from box_agent.tools.sub_agent_capabilities import BUILTIN_TOOL_CAPABILITIES, ToolCapabilityMetadata
+
+    class WriteProtocol(stdio_compat._WritePipeProtocol):
+        def pause_writing(self):
+            super().pause_writing()
+            (root / "stdout-paused").touch()
+
+    stdio_compat._WritePipeProtocol = WriteProtocol
 
     for name in ("fixture_count", "fixture_nested"):
         BUILTIN_TOOL_CAPABILITIES[name] = ToolCapabilityMetadata(read=True)

@@ -12,7 +12,8 @@ silently dies; every subsequent outgoing RPC is then rejected with
 We replicate just the stdio helpers (``_WritePipeProtocol``,
 ``_StdoutTransport``, ``_start_stdin_feeder``, plus the POSIX/Windows variants)
 from upstream and pass ``limit=_READ_LIMIT`` when constructing the reader.
-The reader also notifies the server when the protocol consumes stdin EOF.
+The reader also notifies the server when the protocol consumes stdin EOF or
+encounters a fatal read error, which stops the SDK receive loop.
 Everything else in ``acp`` — ``AgentSideConnection``, ``Connection``, the
 dispatcher, schemas — is still used unchanged.
 """
@@ -42,11 +43,21 @@ class _StdioStreamReader(asyncio.StreamReader):
         self._on_eof = on_eof
 
     async def readline(self) -> bytes:
-        line = await super().readline()
-        if not line and self._on_eof is not None:
+        try:
+            line = await super().readline()
+        except Exception:
+            # The SDK will not read again after a framing or I/O failure.
+            # CancelledError remains a transient read cancellation, not EOF.
+            self._notify_closed()
+            raise
+        if not line:
+            self._notify_closed()
+        return line
+
+    def _notify_closed(self) -> None:
+        if self._on_eof is not None:
             callback, self._on_eof = self._on_eof, None
             callback()
-        return line
 
 
 class _WritePipeProtocol(asyncio.BaseProtocol):
@@ -150,7 +161,7 @@ async def _posix_stdio_streams(
 async def stdio_streams_largebuf(
     *, on_eof: Callable[[], None] | None = None,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """ACP stdio with a 32 MiB reader limit and optional consumed-EOF notification."""
+    """ACP stdio with a 32 MiB limit; notify on consumed EOF or fatal read error."""
     loop = asyncio.get_running_loop()
     if platform.system() == "Windows":
         return await _windows_stdio_streams(loop, on_eof)

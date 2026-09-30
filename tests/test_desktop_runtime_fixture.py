@@ -1,6 +1,7 @@
 """Deterministic desktop scenarios also run through real ACP stdio in CI."""
 
 import asyncio
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -120,5 +121,76 @@ async def test_desktop_fixture_closes_resources_when_host_disconnects(mode, shut
             assert not probe._protocol.parse_errors
         finally:
             await probe.stop()
+        assert "Task was destroyed" not in probe.stderr_text
+        assert "Task exception was never retrieved" not in probe.stderr_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["oversized_stdin", "stdout_pressure"])
+@pytest.mark.parametrize("shutdown", ["eof", "sigterm"])
+async def test_desktop_fixture_exits_after_transport_failure(mode, shutdown):
+    if os.name == "nt":
+        pytest.skip("POSIX pipe backpressure and catchable SIGTERM regression")
+    from box_agent.acp.stdio_compat import _READ_LIMIT
+
+    workspace = Path(__file__).resolve().parents[1] / "workspace"
+    workspace.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="desktop-transport-", dir=workspace) as directory:
+        root = Path(directory)
+        probe = AcpHostProbe(
+            command=[sys.executable, "-m", "tests.desktop_runtime_fixture"], cwd=root,
+            env={"BOX_AGENT_DESKTOP_TEST_ROOT": str(root), "BOX_AGENT_HOME": str(root / "profile"),
+                 "PYTHONUTF8": "1"}, timeout_s=20,
+        )
+        await probe.start()
+        process = probe._proc
+        try:
+            await probe.initialize()
+            session = await probe.session_new(cwd=str(root / "profile/workspaces/test"))
+            if mode == "oversized_stdin":
+                text = "x" * (_READ_LIMIT + 1)
+            else:
+                text = "fixture:stdout_pressure"
+            with suppress(BrokenPipeError, ConnectionResetError):
+                await _send(process, probe._protocol, {
+                    "jsonrpc": "2.0", "id": 900, "method": "session/prompt",
+                    "params": {"sessionId": session, "prompt": [{"type": "text", "text": text}]},
+                })
+            if mode == "stdout_pressure":
+                async def wait_for_backpressure():
+                    while not (root / "stdout-paused").exists():
+                        assert process.returncode is None
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(wait_for_backpressure(), 5)
+            if shutdown == "eof":
+                process.stdin.close()
+            elif process.returncode is None:
+                process.send_signal(signal.SIGTERM)
+
+            # Process.wait() also waits for buffered stdout to drain. Observe
+            # OS exit without consuming stdout or sending fallback signals.
+            async def wait_for_exit():
+                while process.returncode is None:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_exit(), 5)
+            assert process.returncode == 0
+            records = [json.loads(line) for line in (root / "lifecycle.jsonl").read_text().splitlines()]
+            assert [r for r in records if r["event"] == "adapter_closed"] == [{
+                "event": "adapter_closed", "remaining_sessions": 0,
+                "closed_sessions": True, "active_runs": 0,
+            }]
+            assert sum(r["event"] == "llm_closed" for r in records) == 1
+        finally:
+            # Release buffered pipe data only after the natural-exit assertion.
+            drain = asyncio.create_task(process.stdout.read())
+            try:
+                await asyncio.wait_for(probe.stop(), 8)
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                await asyncio.wait_for(process.wait(), 3)
+                await asyncio.wait_for(drain, 3)
         assert "Task was destroyed" not in probe.stderr_text
         assert "Task exception was never retrieved" not in probe.stderr_text
