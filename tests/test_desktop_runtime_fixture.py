@@ -1,7 +1,10 @@
 """Deterministic desktop scenarios also run through real ACP stdio in CI."""
 
+import asyncio
 import json
+import os
 from pathlib import Path
+import signal
 import sys
 from tempfile import TemporaryDirectory
 
@@ -10,6 +13,7 @@ import pytest
 from tests.acp_host.probe import (
     AcpHostProbe, RpcError, collect_session_updates, message_text_from_updates,
 )
+from acp_eval.transport import _send
 
 
 @pytest.mark.asyncio
@@ -55,3 +59,66 @@ async def test_desktop_fixture_reports_real_run_outcome(mode):
                 ]
         finally:
             await probe.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["idle", "permission", "stream_wait"])
+@pytest.mark.parametrize("shutdown", ["eof", "sigterm", "eof_and_sigterm"])
+async def test_desktop_fixture_closes_resources_when_host_disconnects(mode, shutdown):
+    if shutdown != "eof" and os.name == "nt":
+        pytest.skip("Windows terminate() does not deliver a catchable SIGTERM")
+    workspace = Path(__file__).resolve().parents[1] / "workspace"
+    workspace.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="desktop-shutdown-", dir=workspace) as directory:
+        root = Path(directory)
+        probe = AcpHostProbe(
+            command=[sys.executable, "-m", "tests.desktop_runtime_fixture"], cwd=root,
+            env={"BOX_AGENT_DESKTOP_TEST_ROOT": str(root), "BOX_AGENT_HOME": str(root / "profile"),
+                 "PYTHONUTF8": "1"}, timeout_s=20,
+        )
+        await probe.start()
+        process = probe._proc
+        try:
+            await probe.initialize()
+            session = await probe.session_new(cwd=str(root / "profile/workspaces/test"))
+            if mode == "idle":
+                response = await probe.session_prompt(session, "fixture:normal")
+                assert response["stopReason"] == "end_turn"
+            else:
+                await _send(process, probe._protocol, {
+                    "jsonrpc": "2.0", "id": 900, "method": "session/prompt",
+                    "params": {"sessionId": session,
+                               "prompt": [{"type": "text", "text": f"fixture:{mode}"}]},
+                })
+
+                async def wait_for_active_request():
+                    while True:
+                        eof, message = await probe._reader.read_frame(deadline=None)
+                        assert not eof, "ACP exited before the test reached an active request"
+                        if mode == "permission" and message.get("method") == "session/request_permission":
+                            return
+                        update = message.get("params", {}).get("update", {})
+                        if mode == "stream_wait" and update.get("content", {}).get("text") == "STREAM_WAIT_READY":
+                            return
+
+                await asyncio.wait_for(wait_for_active_request(), 5)
+            assert process.returncode is None
+            if shutdown in {"eof", "eof_and_sigterm"}:
+                process.stdin.close()
+            if shutdown in {"sigterm", "eof_and_sigterm"}:
+                process.send_signal(signal.SIGTERM)
+            # Assert natural completion before probe.stop() can send TERM/KILL.
+            assert await asyncio.wait_for(process.wait(), 5) == 0
+            records = [json.loads(line) for line in (root / "lifecycle.jsonl").read_text().splitlines()]
+            assert [r for r in records if r["event"] == "adapter_closed"] == [{
+                "event": "adapter_closed", "remaining_sessions": 0,
+                "closed_sessions": True, "active_runs": 0,
+            }]
+            assert sum(r["event"] == "llm_closed" for r in records) == 1
+            if mode == "stream_wait":
+                assert sum(r["event"] == "stream_closed" for r in records) == 1
+            assert not probe._protocol.parse_errors
+        finally:
+            await probe.stop()
+        assert "Task was destroyed" not in probe.stderr_text
+        assert "Task exception was never retrieved" not in probe.stderr_text

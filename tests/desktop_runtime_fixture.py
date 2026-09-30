@@ -20,6 +20,12 @@ scenario = ContextVar("desktop_test_scenario", default="normal")
 executions = ContextVar("desktop_test_executions", default=None)
 
 
+def record_lifecycle(event, **details):
+    root = Path(os.environ["BOX_AGENT_DESKTOP_TEST_ROOT"])
+    with (root / "lifecycle.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps({"event": event, **details}) + "\n")
+
+
 class CountTool(Tool):
     name = "fixture_count"
     description = "Record a synthetic test execution; no external side effects."
@@ -82,6 +88,9 @@ class FixtureLLM:
     async def generate(self, *args, **kwargs):
         return LLMResponse(content='{"continue": false}', finish_reason="stop")
 
+    async def aclose(self):
+        record_lifecycle("llm_closed")
+
     async def generate_stream(self, messages, tools=None, **kwargs):
         users = "\n".join(str(message.content) for message in messages if message.role == "user")
         has_results = any(message.role == "tool" for message in messages)
@@ -104,6 +113,13 @@ class FixtureLLM:
         if not has_results and mode.startswith("permission"):
             yield StreamEvent(type="finish", finish_reason="tool_use",
                               tool_calls=[call("fixture_permission", {}, 0)])
+            return
+        if mode == "stream_wait":
+            try:
+                yield StreamEvent(type="text", delta="STREAM_WAIT_READY")
+                await asyncio.Event().wait()
+            finally:
+                record_lifecycle("stream_closed")
             return
         if mode == "oversize":
             yield StreamEvent(type="text", delta="x" * 70000)
@@ -150,6 +166,13 @@ def install_fixture(acp, root):
             # Host bindings are retained on the session, but this opt-in test
             # process never loads credentials or contacts a real provider.
             return self._llm
+
+        async def aclose(self):
+            states = list(self._sessions.values())
+            await super().aclose()
+            record_lifecycle("adapter_closed", remaining_sessions=len(self._sessions),
+                             closed_sessions=all(state._closed for state in states),
+                             active_runs=sum(state.run_handle.is_active for state in states))
 
         async def prompt(self, params):
             text = " ".join(str(getattr(block, "text", block.get("text", "") if isinstance(block, dict) else ""))

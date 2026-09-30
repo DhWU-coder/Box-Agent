@@ -125,7 +125,7 @@ async def tools(*args, **kwargs):
     calls.append("no-background-tools")
     return result
 acp.initialize_base_tools = tools
-async def streams(): return object(), SimpleNamespace(transport=SimpleNamespace(_is_closing=False))
+async def streams(**kwargs): return object(), SimpleNamespace(transport=SimpleNamespace(_is_closing=False))
 acp.stdio_streams_largebuf = streams
 
 async def probe():
