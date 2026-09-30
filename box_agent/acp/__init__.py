@@ -78,7 +78,7 @@ from box_agent.agent_runtime import (
     build_permission_engine,
 )
 from box_agent.agent_run import AgentRunHandle
-from box_agent.api import RunRequest
+from box_agent.api import RunRequest, RunStatus
 from box_agent.acp.stdio_compat import stdio_streams_largebuf
 from box_agent.agent import (
     Agent,
@@ -4823,7 +4823,7 @@ class BoxACPAgent:
                                 else:
                                     _schedule_follow_up_suggestions(final_content)
                             await _send_turn_usage()
-                            return reason.value
+                            break
 
                         case SubAgentEvent(parent_tool_call_id=tid, task_preview=preview, event=inner, sub_agent_id=sub_agent_id, title=sub_title):
                             if (
@@ -4966,7 +4966,18 @@ class BoxACPAgent:
                     log.exception("event/error", exc, session_id=session_id, event=type(event).__name__)
                     # Don't break the loop — continue processing events
 
-        return "end_turn"
+        # Exiting the stream settles producer cleanup, including cancellation
+        # when the host closes after DoneEvent. Its final result may have been
+        # replaced by a cleanup failure after the terminal event was published.
+        result = await protocol_handle.result()
+        if result.status is RunStatus.FAILED:
+            state.last_error = str(
+                (result.error or {}).get("message")
+                or state.last_error
+                or "Agent execution failed."
+            )
+            return StopReason.ERROR.value
+        return result.stop_reason
 
     async def _send(self, session_id: str, update: Any) -> None:
         try:

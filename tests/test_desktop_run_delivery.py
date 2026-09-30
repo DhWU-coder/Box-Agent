@@ -206,3 +206,102 @@ async def test_acp_blocked_send_times_out_and_stops_run(tmp_path, monkeypatch):
         assert not adapter._sessions[request.sessionId]._run_handle.is_active
     finally:
         await adapter.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_close", [False, True])
+async def test_acp_reports_post_done_cleanup_failure_and_can_run_again(
+    tmp_path, monkeypatch, during_close,
+):
+    cleanup_started = asyncio.Event()
+    fail_next = True
+
+    class CleanupKernel(BurstKernel):
+        async def run(self):
+            nonlocal fail_next
+            if not fail_next:
+                yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="recovered")
+                return
+            fail_next = False
+            try:
+                yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="answer")
+            finally:
+                cleanup_started.set()
+                try:
+                    if during_close:
+                        await asyncio.Event().wait()
+                finally:
+                    raise RuntimeError("post-Done cleanup failed")
+
+    adapter, request = await make_adapter(tmp_path, monkeypatch, CleanupKernel, DummyConn())
+    try:
+        response = await asyncio.wait_for(adapter.prompt(request), 5)
+        handle = adapter._sessions[request.sessionId]._run_handle
+        assert cleanup_started.is_set()
+        assert not handle.is_active
+        assert (await handle.result()).status == "failed"
+        assert response.stopReason == "end_turn"  # ACP has no generic error stop reason.
+        assert response.field_meta["ok"] is False
+        assert response.field_meta["completed"] is False
+        assert response.field_meta["runStatus"] == "error"
+        assert response.field_meta["lastStopReason"] == "error"
+        assert response.field_meta["error"] == "post-Done cleanup failed"
+
+        recovered = await asyncio.wait_for(adapter.prompt(request), 5)
+        assert recovered.stopReason == "end_turn"
+        assert recovered.field_meta["ok"] is True
+        assert recovered.field_meta["completed"] is True
+        assert recovered.field_meta["error"] is None
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason,acp_reason", [
+    (StopReason.END_TURN, "end_turn"),
+    (StopReason.WAITING_FOR_USER, "end_turn"),
+    (StopReason.MAX_STEPS, "max_turn_requests"),
+])
+async def test_acp_closes_pending_cleanup_and_preserves_terminal_reason(
+    tmp_path, monkeypatch, reason, acp_reason,
+):
+    cleanup_cancelled = asyncio.Event()
+
+    class ClosingKernel(BurstKernel):
+        async def run(self):
+            try:
+                yield DoneEvent(stop_reason=reason, final_content="answer")
+            finally:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_cancelled.set()
+
+    adapter, request = await make_adapter(tmp_path, monkeypatch, ClosingKernel, DummyConn())
+    try:
+        response = await asyncio.wait_for(adapter.prompt(request), 5)
+        assert cleanup_cancelled.is_set()
+        assert not adapter._sessions[request.sessionId]._run_handle.is_active
+        assert response.stopReason == acp_reason
+        assert response.field_meta["ok"] is True
+        assert response.field_meta["lastStopReason"] == reason.value
+        assert response.field_meta["completed"] is (reason != StopReason.WAITING_FOR_USER)
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_reports_missing_terminal_event_as_failure(tmp_path, monkeypatch):
+    class MissingDoneKernel(BurstKernel):
+        async def run(self):
+            yield ContentEvent(content="partial answer")
+
+    adapter, request = await make_adapter(tmp_path, monkeypatch, MissingDoneKernel, DummyConn())
+    try:
+        response = await asyncio.wait_for(adapter.prompt(request), 5)
+        assert response.field_meta["ok"] is False
+        assert response.field_meta["completed"] is False
+        assert response.field_meta["runStatus"] == "error"
+        assert response.field_meta["error"] == "run ended without a DoneEvent"
+    finally:
+        await adapter.aclose()
