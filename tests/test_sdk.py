@@ -62,6 +62,23 @@ async def test_sdk_client_starts_and_completes_a_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sdk_result_only_run_reports_cleanup_failure_after_done() -> None:
+    class CleanupFailureSession(_Session):
+        async def run_events(self, *, options=None):
+            try:
+                yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="answer")
+            finally:
+                raise RuntimeError("cleanup failed")
+
+    result = await AgentClient(CleanupFailureSession()).run(
+        RunRequest("sdk-cleanup", "sdk-session", "Explain this"),
+    )
+
+    assert result.status == "failed"
+    assert result.error == {"type": "RuntimeError", "message": "cleanup failed"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("approved", [False, True])
 async def test_sdk_result_only_run_uses_permission_callback(approved):
     decisions = []

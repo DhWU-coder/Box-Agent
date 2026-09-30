@@ -209,7 +209,9 @@ class AgentRunHandle:
         except BaseException as exc:
             exc = self._delivery_error or exc
             self._runner_error = exc
-            if self._collector.result is None or isinstance(exc, RunDeliveryError):
+            # Closing a handle after DoneEvent may cancel pending cleanup.
+            if (self._collector.result is None
+                    or not isinstance(exc, asyncio.CancelledError)):
                 self._collector.result = RunResult(
                     run_id=self.run_id,
                     status=RunStatus.CANCELLED if isinstance(exc, asyncio.CancelledError)

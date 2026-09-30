@@ -190,6 +190,31 @@ async def test_closing_handle_settles_active_run_and_closes_its_stream() -> None
     assert (await handle.result()).status == "cancelled"
 
 
+@pytest.mark.asyncio
+async def test_closing_handle_after_done_preserves_completed_result() -> None:
+    cleaning = asyncio.Event()
+
+    class ClosingSession(_FakeSession):
+        async def run_events(self, *, options=None):
+            try:
+                yield DoneEvent(stop_reason=StopReason.END_TURN, final_content="finished")
+            finally:
+                cleaning.set()
+                await asyncio.Event().wait()
+
+    handle = await AgentService().start(
+        RunRequest("close-after-done", "session", "Work"), session=ClosingSession(),
+    )
+    result_waiter = asyncio.create_task(handle.result())
+    await cleaning.wait()
+
+    await handle.aclose()
+
+    result = await result_waiter
+    assert result.status == "completed"
+    assert result.final_content == "finished"
+
+
 class _SessionAgent(_FakeAgent):
     def default_run_options(self):
         return AgentRunOptions(llm=None)
