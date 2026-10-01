@@ -56,3 +56,15 @@ ACP 的 stdio reader 消费完缓冲帧并读到 stdin EOF 后，通知服务进
 提供方流的读取任务如果已经结束，而外层消费者在取结果前被取消，共享流控制器仍需回收已完成任务的异常；否则正常耗尽产生的 `StopAsyncIteration` 会被事件循环报告为未处理任务异常。未完成的读取仍取消并等待清理，正常消费路径的提供方错误和取消期间的清理错误仍按原语义传播。同步屏障回归覆盖任务耗尽、失败和成功与取消交错的情形。
 
 此行为不增加宿主协议字段，不改变正常 `session/cancel` 的响应时限。验证区分源码进程回归与 Windows feeder 的单元测试；没有将其表述为已安装新的 standalone runtime 或完成 OfficeV3 桌面验收。
+
+### 同会话重叠任务的拒绝与隔离
+
+同一个 ACP 会话的 `session/prompt` 从准备开始到收尾结束只允许一个请求占用。重叠请求在修改历史、权限、模型绑定、取消状态或注入队列前返回 JSON-RPC 错误；拒绝不会清除原任务的活动标记或执行其清理。不同会话仍可并发，原任务结束后可继续提交新任务。准备阶段异常或取消也会释放占用。
+
+此前重叠请求通常返回 `-32603 / Internal error`，原因仅在 `data.details` 中；准备阶段还可能未被内层运行检查拦截。现在固定返回 `code=-32010`、`data.code="SESSION_BUSY"` 和 `data.sessionId`，message 为：
+
+> This session already has an active task. Wait for it to finish, or cancel it and wait for cancellation to complete before retrying.
+
+含义是“当前会话已有任务，请等待它结束，或取消并等待取消完成后再试”。继续使用标准 JSON-RPC error 响应；只重试当前错误码的宿主需关注错误码变化。运行中补充消息仍使用 `_inject`。没有向原任务插入错误消息或伪造终态，也不自动排队或重复执行被拒绝的任务。
+
+回归覆盖准备、执行、收尾和取消期间的重叠请求，证明原历史、授权、注入去重与取消状态保留；真实 stdio 子进程验证错误文字、原权限请求继续批准/取消、后续任务恢复和 EOF 资源关闭。此证据止于源码 ACP 进程；OfficeV3 的界面错误展示和已安装 runtime 未在此验证。
