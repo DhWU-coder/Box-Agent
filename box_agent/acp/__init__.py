@@ -51,6 +51,7 @@ from acp import (
     NewSessionResponse,
     PromptRequest,
     PromptResponse,
+    RequestError,
     session_notification,
     start_tool_call,
     text_block,
@@ -956,6 +957,7 @@ def _tool_result_raw_output(
 class SessionState(AgentSession):
     """ACP metadata layered over the independent Agent session state."""
 
+    _prompt_in_progress: bool = field(default=False, init=False, repr=False)
     trace_writer: SessionTraceWriter | None = None
     session_mode: str | None = None
     llm_binding: dict[str, Any] | None = None
@@ -2352,6 +2354,26 @@ class BoxACPAgent:
                 log.error("session/prompt", session_id=session_id, message="Failed to auto-create session")
                 return PromptResponse(stopReason="refusal")
 
+        # Reserve the whole ACP request before preparation mutates shared state.
+        # AgentService only guards the inner run; preparation and finalization
+        # also own history, grants, cancellation and the injection queue.
+        # There is no await between checking and claiming this event-loop flag.
+        if state._prompt_in_progress or state.run_handle.is_active:
+            raise RequestError(
+                -32010,
+                "This session already has an active task. Wait for it to finish, "
+                "or cancel it and wait for cancellation to complete before retrying.",
+                {"code": "SESSION_BUSY", "sessionId": session_id},
+            )
+        state._prompt_in_progress = True
+        try:
+            return await self._prompt_for_session(params, session_id, state)
+        finally:
+            state._prompt_in_progress = False
+
+    async def _prompt_for_session(
+        self, params: PromptRequest, session_id: str, state: SessionState,
+    ) -> PromptResponse:
         self._config_for_session(state)
 
         # Prompt-scoped grants cover both deterministic attachment processing

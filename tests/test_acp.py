@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from acp import text_block, update_agent_message
+from acp import RequestError, text_block, update_agent_message
 
 import box_agent.acp as acp_module
 import box_agent.composition as composition_module
@@ -1830,6 +1830,145 @@ async def test_prompt_clears_prompt_grants_once_before_attachment_processing(
 
     assert clear_calls == 1
     assert not state.grant_store.has_grant("filesystem", "user_home")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase,cancel_requested", [
+    ("preparation", False), ("preparation", True),
+    ("running", False), ("running", True), ("finalization", False),
+])
+async def test_overlapping_prompt_preserves_original_task_state(
+    tmp_path, monkeypatch, phase, cancel_requested
+):
+    from copy import deepcopy
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingLLM(DoneLLM):
+        async def generate_stream(self, *args, **kwargs):
+            if phase == "running" and not started.is_set():
+                started.set()
+                await release.wait()
+            async for event in super().generate_stream(*args, **kwargs):
+                yield event
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=3, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, BlockingLLM(), [], "system")
+    session = await agent.newSession(SimpleNamespace(
+        cwd=str(tmp_path), field_meta={"permission_mode": "default"},
+    ))
+    state = agent._sessions[session.sessionId]
+    original_attachment = agent._run_image_attachment_tool
+
+    async def attachment(**kwargs):
+        if phase == "preparation" and not started.is_set():
+            started.set()
+            await release.wait()
+        return await original_attachment(**kwargs)
+
+    monkeypatch.setattr(agent, "_run_image_attachment_tool", attachment)
+    original_cleanup = acp_module.cleanup_turn_resources
+
+    async def cleanup(**kwargs):
+        if phase == "finalization" and not started.is_set():
+            started.set()
+            await release.wait()
+        return await original_cleanup(**kwargs)
+
+    monkeypatch.setattr(acp_module, "cleanup_turn_resources", cleanup)
+    first = asyncio.create_task(agent.prompt(SimpleNamespace(
+        sessionId=session.sessionId, prompt=[{"text": "original task"}],
+    )))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        state.grant_store.add_grant("filesystem", "user_home", "prompt")
+        state.inject_queue.submit({"id": "keep", "content": "keep supplement"})
+        if cancel_requested:
+            await agent.cancel(SimpleNamespace(sessionId=session.sessionId))
+        history = deepcopy(state.agent.messages)
+        turn_id, turn_counter = state.current_turn_id, state.turn_counter
+        handle, injection_run = state.run_handle, state.inject_queue.run_id
+
+        with pytest.raises(RequestError) as raised:
+            await asyncio.wait_for(agent.prompt(SimpleNamespace(
+                sessionId=session.sessionId, prompt=[{"text": "must not enter history"}],
+                field_meta={"selected_connector_ids": ["unexpected"]},
+            )), 5)
+
+        assert raised.value.code == -32010
+        assert raised.value.data == {"code": "SESSION_BUSY", "sessionId": session.sessionId}
+        assert "Wait for it to finish" in str(raised.value)
+        assert state.agent.messages == history
+        assert state.current_turn_id == turn_id and state.turn_counter == turn_counter
+        assert state.run_handle is handle
+        assert state.cancelled is cancel_requested
+        assert state.grant_store.has_grant("filesystem", "user_home")
+        assert state.inject_queue.run_id == injection_run
+        assert state.inject_queue.qsize() == 1
+        assert not state.selected_connector_ids
+        assert not first.done()
+        if phase == "running":
+            assert state.turn_active
+            result = await agent.extMethod("inject", {
+                "sessionId": session.sessionId, "text": "another supplement", "injectionId": "new",
+            })
+            assert result["ok"] is True
+            # The rejected request must not clear deduplication receipts either.
+            duplicate = await agent.extMethod("inject", {
+                "sessionId": session.sessionId, "text": "keep supplement", "injectionId": "keep",
+            })
+            assert duplicate["deduplicated"] is True
+        # A busy session must not reserve other sessions on the same adapter.
+        peer = await agent.newSession(SimpleNamespace(cwd=str(tmp_path), field_meta={}))
+        response = await asyncio.wait_for(agent.prompt(SimpleNamespace(
+            sessionId=peer.sessionId, prompt=[{"text": "independent task"}],
+        )), 5)
+        assert response.field_meta["ok"] is True
+        release.set()
+        response = await asyncio.wait_for(first, 5)
+        assert response.stopReason == ("cancelled" if cancel_requested else "end_turn")
+        followup = await agent.prompt(SimpleNamespace(
+            sessionId=session.sessionId, prompt=[{"text": "next task"}],
+        ))
+        assert followup.field_meta["ok"] is True
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, return_exceptions=True), 5)
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancelled"])
+async def test_prompt_preparation_failure_allows_next_task(tmp_path, monkeypatch, failure):
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    session = await agent.newSession(SimpleNamespace(cwd=str(tmp_path), field_meta={}))
+    original = agent._run_image_attachment_tool
+
+    async def fail(**kwargs):
+        if failure == "error":
+            raise RuntimeError("attachment failed")
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(agent, "_run_image_attachment_tool", fail)
+    params = SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": "task"}])
+    try:
+        with pytest.raises(RuntimeError if failure == "error" else asyncio.CancelledError):
+            await agent.prompt(params)
+        monkeypatch.setattr(agent, "_run_image_attachment_tool", original)
+        response = await agent.prompt(params)
+        assert response.field_meta["ok"] is True
+    finally:
+        await agent.aclose()
 
 
 class EmptyFinalAnswerLLM:

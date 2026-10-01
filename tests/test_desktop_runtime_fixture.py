@@ -18,6 +18,79 @@ from acp_eval.transport import _send
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["approve", "cancel"])
+async def test_desktop_fixture_busy_error_preserves_original_prompt(finish):
+    workspace = Path(__file__).resolve().parents[1] / "workspace"
+    workspace.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="desktop-overlap-", dir=workspace) as directory:
+        root = Path(directory)
+        probe = AcpHostProbe(
+            command=[sys.executable, "-m", "tests.desktop_runtime_fixture"], cwd=root,
+            env={"BOX_AGENT_DESKTOP_TEST_ROOT": str(root), "BOX_AGENT_HOME": str(root / "profile"),
+                 "PYTHONUTF8": "1"}, timeout_s=10,
+        )
+        await probe.start()
+        process = probe._proc
+
+        async def read_until(predicate):
+            while True:
+                eof, message = await probe._reader.read_frame(deadline=None)
+                assert not eof, "ACP exited while the original prompt was active"
+                assert not probe._protocol.parse_errors
+                if message and predicate(message):
+                    return message
+
+        try:
+            await probe.initialize()
+            session = await probe.session_new(cwd=str(root / "profile/workspaces/test"))
+            await _send(process, probe._protocol, {
+                "jsonrpc": "2.0", "id": 900, "method": "session/prompt",
+                "params": {"sessionId": session,
+                           "prompt": [{"type": "text", "text": "fixture:permission"}]},
+            })
+            permission = await asyncio.wait_for(read_until(
+                lambda m: m.get("method") == "session/request_permission",
+            ), 5)
+            supplement = {"sessionId": session, "text": "keep supplement", "injectionId": "keep"}
+            assert (await probe.request("_inject", supplement))["ok"] is True
+            with pytest.raises(RpcError) as raised:
+                await probe.session_prompt(session, "fixture:normal")
+            assert raised.value.code == -32010
+            assert raised.value.data == {"code": "SESSION_BUSY", "sessionId": session}
+            assert "Wait for it to finish" in raised.value.message
+            assert "wait for cancellation to complete" in raised.value.message
+            assert (await probe.request("_inject", supplement))["deduplicated"] is True
+            assert (await probe.request("_inject", {
+                "sessionId": session, "text": "new supplement", "injectionId": "new",
+            }))["ok"] is True
+            if finish == "approve":
+                option = next(o["optionId"] for o in permission["params"]["options"]
+                              if o["kind"] == "allow_once")
+                await _send(process, probe._protocol, {
+                    "jsonrpc": "2.0", "id": permission["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": option}},
+                })
+            else:
+                await probe.notify("session/cancel", {"sessionId": session})
+            response = await asyncio.wait_for(read_until(lambda m: m.get("id") == 900), 5)
+            assert "error" not in response
+            assert response["result"]["stopReason"] == ("end_turn" if finish == "approve" else "cancelled")
+            record = json.loads((root / "results.jsonl").read_text().splitlines()[-1])
+            assert len(record["executions"]) == (1 if finish == "approve" else 0)
+            assert (await probe.session_prompt(session, "fixture:normal"))["_meta"]["ok"] is True
+            process.stdin.close()
+            assert await asyncio.wait_for(process.wait(), 5) == 0
+            lifecycle = [json.loads(line) for line in (root / "lifecycle.jsonl").read_text().splitlines()]
+            assert any(r["event"] == "adapter_closed" and r["active_runs"] == 0 for r in lifecycle)
+            assert any(r["event"] == "llm_closed" for r in lifecycle)
+            assert not probe._protocol.parse_errors
+        finally:
+            await probe.stop()
+        assert "Task exception was never retrieved" not in probe.stderr_text
+        assert "Task was destroyed" not in probe.stderr_text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["normal", "slow", "oversize", "timeout", "budget", "nested"])
 async def test_desktop_fixture_reports_real_run_outcome(mode):
     workspace = Path(__file__).resolve().parents[1] / "workspace"
