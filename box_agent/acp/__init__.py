@@ -953,6 +953,19 @@ def _tool_result_raw_output(
     }
 
 
+def _session_busy_error(session_id: str | None, *, rebinding: bool = False) -> RequestError:
+    data = {"code": "SESSION_BUSY"}
+    if session_id is not None:
+        data["sessionId"] = session_id
+    message = (
+        "This session is being created or rebound. Wait for it to finish before retrying."
+        if rebinding else
+        "This session already has an active task. Wait for it to finish, "
+        "or cancel it and wait for cancellation to complete before retrying."
+    )
+    return RequestError(-32010, message, data)
+
+
 @dataclass
 class SessionState(AgentSession):
     """ACP metadata layered over the independent Agent session state."""
@@ -1208,6 +1221,7 @@ class BoxACPAgent:
         self._base_tools = base_tools
         self._system_prompt = system_prompt
         self._sessions: dict[str, SessionState] = {}
+        self._session_bindings_in_progress: dict[str, tuple[str, ...]] = {}
         self._client_info: ClientInfo | None = None
         self._memory = memory_manager
         self._hooks = hooks
@@ -1619,6 +1633,35 @@ class BoxACPAgent:
         return resp
 
     async def newSession(self, params: NewSessionRequest) -> NewSessionResponse:
+        meta = getattr(params, "field_meta", None) or {}
+        raw_upstream = meta.get("session_id") if isinstance(meta, dict) else None
+        upstream_session_id = raw_upstream.strip() if isinstance(raw_upstream, str) else ""
+        if not upstream_session_id:
+            return await self._new_session(params, upstream_session_id)
+
+        reserved = self._session_bindings_in_progress.get(upstream_session_id)
+        if reserved is not None:
+            raise _session_busy_error(next(iter(reserved), None), rebinding=True)
+        existing = tuple(
+            handle for handle, state in self._sessions.items()
+            if state.upstream_session_id == upstream_session_id
+        )
+        for handle in existing:
+            state = self._sessions[handle]
+            if state._prompt_in_progress or state.turn_active or state.run_handle.is_active:
+                raise _session_busy_error(handle)
+        # No await between checking and reserving. Keep retired handles reserved
+        # through close/open awaits too, so prompt cannot auto-create a session
+        # while the original handle is temporarily absent from _sessions.
+        self._session_bindings_in_progress[upstream_session_id] = existing
+        try:
+            return await self._new_session(params, upstream_session_id)
+        finally:
+            del self._session_bindings_in_progress[upstream_session_id]
+
+    async def _new_session(
+        self, params: NewSessionRequest, upstream_session_id: str,
+    ) -> NewSessionResponse:
         # Skill discovery ran in the background so stdio came up fast; make
         # sure the catalog is present before we build the session's system
         # prompt (SkillSelector.bind reads the sentinel; the metadata block
@@ -1638,7 +1681,6 @@ class BoxACPAgent:
         execution_profile = normalize_execution_profile(None)
         env_context: EnvContext | None = None
         expert_context: ExpertSessionContext | None = None
-        upstream_session_id = ""
         initial_task_id = ""
         upstream_title = _DEFAULT_AGENT_TITLE
         force_plan_start = False
@@ -1710,12 +1752,6 @@ class BoxACPAgent:
                 )
             env_context = EnvContext.from_meta(meta.get("env_context"))
             expert_context = ExpertSessionContext.from_meta(meta)
-            # Caller-owned correlation metadata forwarded to the LLM gateway.
-            # This session id is distinct from the ACP `session_id` above
-            # (``sess-N-xxxx``), which is our own per-connection handle.
-            raw_upstream = meta.get("session_id")
-            if isinstance(raw_upstream, str):
-                upstream_session_id = raw_upstream.strip()
             initial_task_id = normalize_task_id(
                 meta.get("task_id") or meta.get("taskId")
             ) or ""
@@ -1950,10 +1986,6 @@ class BoxACPAgent:
             for existing_handle, existing_state in list(self._sessions.items()):
                 if existing_state.upstream_session_id != upstream_session_id:
                     continue
-                if existing_state.turn_active:
-                    raise ValueError(
-                        "cannot rebind a product Session while its turn is active"
-                    )
                 existing_log = existing_state.agent.session_log
                 if existing_log is not None:
                     existing_log.assert_workspace(workspace)
@@ -2338,6 +2370,8 @@ class BoxACPAgent:
 
     async def prompt(self, params: PromptRequest) -> PromptResponse:
         session_id = params.sessionId
+        if any(session_id in handles for handles in self._session_bindings_in_progress.values()):
+            raise _session_busy_error(session_id, rebinding=True)
         state = self._sessions.get(session_id)
         if not state:
             # Auto-create session if not found (compatibility with clients that skip newSession)
@@ -2359,12 +2393,7 @@ class BoxACPAgent:
         # also own history, grants, cancellation and the injection queue.
         # There is no await between checking and claiming this event-loop flag.
         if state._prompt_in_progress or state.run_handle.is_active:
-            raise RequestError(
-                -32010,
-                "This session already has an active task. Wait for it to finish, "
-                "or cancel it and wait for cancellation to complete before retrying.",
-                {"code": "SESSION_BUSY", "sessionId": session_id},
-            )
+            raise _session_busy_error(session_id)
         state._prompt_in_progress = True
         try:
             return await self._prompt_for_session(params, session_id, state)

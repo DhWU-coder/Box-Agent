@@ -1833,12 +1833,13 @@ async def test_prompt_clears_prompt_grants_once_before_attachment_processing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_kind", ["prompt", "rebind"])
 @pytest.mark.parametrize("phase,cancel_requested", [
     ("preparation", False), ("preparation", True),
     ("running", False), ("running", True), ("finalization", False),
 ])
-async def test_overlapping_prompt_preserves_original_task_state(
-    tmp_path, monkeypatch, phase, cancel_requested
+async def test_overlapping_request_preserves_original_task_state(
+    tmp_path, monkeypatch, phase, cancel_requested, request_kind
 ):
     from copy import deepcopy
 
@@ -1860,7 +1861,8 @@ async def test_overlapping_prompt_preserves_original_task_state(
     )
     agent = BoxACPAgent(DummyConn(), config, BlockingLLM(), [], "system")
     session = await agent.newSession(SimpleNamespace(
-        cwd=str(tmp_path), field_meta={"permission_mode": "default"},
+        cwd=str(tmp_path),
+        field_meta={"permission_mode": "default", "session_id": "busy-product"},
     ))
     state = agent._sessions[session.sessionId]
     original_attachment = agent._run_image_attachment_tool
@@ -1895,14 +1897,21 @@ async def test_overlapping_prompt_preserves_original_task_state(
         handle, injection_run = state.run_handle, state.inject_queue.run_id
 
         with pytest.raises(RequestError) as raised:
-            await asyncio.wait_for(agent.prompt(SimpleNamespace(
-                sessionId=session.sessionId, prompt=[{"text": "must not enter history"}],
-                field_meta={"selected_connector_ids": ["unexpected"]},
-            )), 5)
+            if request_kind == "rebind":
+                await asyncio.wait_for(agent.newSession(SimpleNamespace(
+                    cwd=str(tmp_path), field_meta={"session_id": "busy-product"},
+                )), 5)
+            else:
+                await asyncio.wait_for(agent.prompt(SimpleNamespace(
+                    sessionId=session.sessionId, prompt=[{"text": "must not enter history"}],
+                    field_meta={"selected_connector_ids": ["unexpected"]},
+                )), 5)
 
         assert raised.value.code == -32010
         assert raised.value.data == {"code": "SESSION_BUSY", "sessionId": session.sessionId}
         assert "Wait for it to finish" in str(raised.value)
+        assert agent._sessions[session.sessionId] is state
+        assert not state._closed
         assert state.agent.messages == history
         assert state.current_turn_id == turn_id and state.turn_counter == turn_counter
         assert state.run_handle is handle
@@ -1932,6 +1941,16 @@ async def test_overlapping_prompt_preserves_original_task_state(
         release.set()
         response = await asyncio.wait_for(first, 5)
         assert response.stopReason == ("cancelled" if cancel_requested else "end_turn")
+        if request_kind == "rebind":
+            history = deepcopy(state.agent.messages)
+            replacement = await agent.newSession(SimpleNamespace(
+                cwd=str(tmp_path), field_meta={"session_id": "busy-product"},
+            ))
+            assert session.sessionId not in agent._sessions
+            assert state._closed
+            restored = agent._sessions[replacement.sessionId]
+            assert restored.agent.messages[1:] == history[1:]
+            session = replacement
         followup = await agent.prompt(SimpleNamespace(
             sessionId=session.sessionId, prompt=[{"text": "next task"}],
         ))
@@ -1943,15 +1962,19 @@ async def test_overlapping_prompt_preserves_original_task_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("next_request", ["prompt", "rebind"])
 @pytest.mark.parametrize("failure", ["error", "cancelled"])
-async def test_prompt_preparation_failure_allows_next_task(tmp_path, monkeypatch, failure):
+async def test_prompt_preparation_failure_allows_next_task(
+    tmp_path, monkeypatch, failure, next_request
+):
     config = Config(
         llm=LLMConfig(api_key="test-key"),
         agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
         tools=ToolsConfig(enable_sub_agent=False),
     )
     agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
-    session = await agent.newSession(SimpleNamespace(cwd=str(tmp_path), field_meta={}))
+    request = SimpleNamespace(cwd=str(tmp_path), field_meta={"session_id": "failed-product"})
+    session = await agent.newSession(request)
     original = agent._run_image_attachment_tool
 
     async def fail(**kwargs):
@@ -1965,9 +1988,135 @@ async def test_prompt_preparation_failure_allows_next_task(tmp_path, monkeypatch
         with pytest.raises(RuntimeError if failure == "error" else asyncio.CancelledError):
             await agent.prompt(params)
         monkeypatch.setattr(agent, "_run_image_attachment_tool", original)
+        if next_request == "rebind":
+            replacement = await agent.newSession(request)
+            assert session.sessionId not in agent._sessions
+            params.sessionId = replacement.sessionId
         response = await agent.prompt(params)
         assert response.field_meta["ok"] is True
     finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["close", "browser", "open"])
+async def test_rebinding_rejects_concurrent_prompt_and_rebind(tmp_path, monkeypatch, phase):
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    request = SimpleNamespace(cwd=str(tmp_path), field_meta={"session_id": "rebinding"})
+    session = await agent.newSession(request)
+    state = agent._sessions[session.sessionId]
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    if phase == "close":
+        owner, name = state, "aclose"
+    elif phase == "browser":
+        owner, name = acp_module, "close_browser_session"
+    else:
+        owner, name = acp_module.SessionState, "open"
+    original = getattr(owner, name)
+
+    async def blocked(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, blocked)
+    pending = asyncio.create_task(agent.newSession(request))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        sessions = dict(agent._sessions)
+        for call in (
+            lambda: agent.prompt(SimpleNamespace(
+                sessionId=session.sessionId, prompt=[{"text": "must not run"}],
+            )),
+            lambda: agent.newSession(request),
+        ):
+            with pytest.raises(RequestError) as raised:
+                await asyncio.wait_for(call(), 5)
+            assert raised.value.code == -32010
+            assert raised.value.data == {"code": "SESSION_BUSY", "sessionId": session.sessionId}
+            assert "being created or rebound" in str(raised.value)
+            assert agent._sessions == sessions
+        # Reservations are per product session, not a global queue.
+        peer = await asyncio.wait_for(agent.newSession(SimpleNamespace(
+            cwd=str(tmp_path), field_meta={"session_id": "independent"},
+        )), 5)
+        response = await agent.prompt(SimpleNamespace(
+            sessionId=peer.sessionId, prompt=[{"text": "independent task"}],
+        ))
+        assert response.field_meta["ok"] is True
+        release.set()
+        replacement = await asyncio.wait_for(pending, 5)
+        assert session.sessionId not in agent._sessions
+        response = await agent.prompt(SimpleNamespace(
+            sessionId=replacement.sessionId, prompt=[{"text": "next task"}],
+        ))
+        assert response.field_meta["ok"] is True
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("failure", ["error", "cancelled"])
+async def test_session_creation_failure_releases_product_reservation(
+    tmp_path, monkeypatch, existing, failure
+):
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    request = SimpleNamespace(cwd=str(tmp_path), field_meta={"session_id": "retry-create"})
+    old = await agent.newSession(request) if existing else None
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = agent._ensure_skills_loaded
+
+    async def fail_once():
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+            if failure == "error":
+                raise RuntimeError("session preparation failed")
+            raise asyncio.CancelledError()
+        return await original()
+
+    monkeypatch.setattr(agent, "_ensure_skills_loaded", fail_once)
+    pending = asyncio.create_task(agent.newSession(request))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        with pytest.raises(RequestError) as raised:
+            await asyncio.wait_for(agent.newSession(request), 5)
+        assert raised.value.code == -32010
+        expected = {"code": "SESSION_BUSY"}
+        if old is not None:
+            expected["sessionId"] = old.sessionId
+        assert raised.value.data == expected
+        release.set()
+        with pytest.raises(RuntimeError if failure == "error" else asyncio.CancelledError):
+            await asyncio.wait_for(pending, 5)
+        if old is not None:
+            response = await agent.prompt(SimpleNamespace(
+                sessionId=old.sessionId, prompt=[{"text": "original session still works"}],
+            ))
+            assert response.field_meta["ok"] is True
+        replacement = await agent.newSession(request)
+        response = await agent.prompt(SimpleNamespace(
+            sessionId=replacement.sessionId, prompt=[{"text": "retry succeeded"}],
+        ))
+        assert response.field_meta["ok"] is True
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
         await agent.aclose()
 
 
