@@ -5724,8 +5724,10 @@ async def run_acp_server(config: Config | None = None) -> None:
             )
             return server_adapter
 
+        request_state = RequestStateStore()
         connection = AgentSideConnection(
-            create_adapter, writer, reader, state_store=RequestStateStore(),
+            create_adapter, writer, reader, state_store=request_state,
+            sender_factory=request_state.create_sender,
         )
 
         log.info("server/ready", message="ACP server ready, listening on stdio")

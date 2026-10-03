@@ -205,7 +205,10 @@ async def test_request_cleanup_preserves_interleaved_sessions_and_host_permissio
             await probe.session_cancel(handles["a"])
             response = await asyncio.wait_for(read_until(lambda m: m.get("id") == 900), 5)
             assert response["result"]["stopReason"] == "cancelled"
-            # A host reply arriving after cancellation is harmless and retires its ID.
+            # Cancellation retires the ID even when the host never replies.
+            state = await probe.ext_request("fixture_rpc_state")
+            assert state["outgoing_requests"] == 0
+            # A host reply arriving after cancellation is harmless.
             await _send(process, probe._protocol, {
                 "jsonrpc": "2.0", "id": permission_a["id"],
                 "result": {"outcome": {"outcome": "cancelled"}},

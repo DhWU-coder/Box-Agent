@@ -135,8 +135,9 @@ async def probe():
     loop.add_signal_handler = lambda signal, callback: shutdown.append(callback)
     loop.remove_signal_handler = lambda signal: True
     initialized = []
-    def connected(factory, writer, reader, *, state_store):
+    def connected(factory, writer, reader, *, state_store, sender_factory):
         assert isinstance(state_store, acp.RequestStateStore)
+        assert sender_factory.__self__ is state_store
         agent = factory(DummyConn())
         async def handshake():
             response = await agent.initialize(SimpleNamespace(field_meta={}))
