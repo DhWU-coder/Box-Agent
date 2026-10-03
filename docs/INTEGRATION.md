@@ -46,6 +46,11 @@ JSON-RPC 错误 `code=-32010`、`data.code="SESSION_BUSY"`，
 首次创建尚无旧句柄时，错误中不包含 `data.sessionId`。服务端不会排队或自动重试；
 其他产品会话不受此限制。请求结束后可正常重建并恢复历史。
 
+宿主关闭 stdin 或终止服务时，ACP 先停止接收新的 `session/new` 和
+`session/prompt`，取消并等待在途会话创建/重绑完成回滚，再释放会话资源。
+关闭期间的新请求返回 `code=-32000`、`data.code="AGENT_CLOSING"`；
+宿主需要重新启动服务后再发起任务。已有任务的取消和最终状态发送仍在协议连接关闭前处理。
+
 ### 场景 A：用户首次打开应用
 
 1. 宿主侧检测：`MEMORY.md` 是否已存在、各个 CLI 是否已安装、Chromium 是否已通过 `box-agent install-browser` 装好。

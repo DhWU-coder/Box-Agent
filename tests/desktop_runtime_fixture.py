@@ -146,6 +146,41 @@ def install_fixture(acp, root):
     from box_agent.acp import stdio_compat
     from box_agent.tools.sub_agent_capabilities import BUILTIN_TOOL_CAPABILITIES, ToolCapabilityMetadata
 
+    binding_phase = os.environ.get("BOX_AGENT_DESKTOP_TEST_BINDING_PHASE", "")
+    block_binding = ContextVar("desktop_test_block_binding", default=False)
+    binding_waited = False
+
+    async def wait_for_binding_shutdown():
+        nonlocal binding_waited
+        if binding_waited:
+            return
+        binding_waited = True
+        (root / "binding-waiting").touch()
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), 30)
+        finally:
+            record_lifecycle("binding_wait_closed")
+
+    if binding_phase == "initialization":
+        import box_agent.session_assembly as assembly
+        original_finish = assembly.finish_session
+
+        async def finish(*args, **kwargs):
+            if block_binding.get():
+                await wait_for_binding_shutdown()
+            return await original_finish(*args, **kwargs)
+
+        assembly.finish_session = finish
+    elif binding_phase == "browser":
+        original_browser_close = acp.close_browser_session
+
+        async def close_browser(*args, **kwargs):
+            if block_binding.get():
+                await wait_for_binding_shutdown()
+            return await original_browser_close(*args, **kwargs)
+
+        acp.close_browser_session = close_browser
+
     class WriteProtocol(stdio_compat._WritePipeProtocol):
         def pause_writing(self):
             super().pause_writing()
@@ -179,12 +214,37 @@ def install_fixture(acp, root):
             # process never loads credentials or contacts a real provider.
             return self._llm
 
+        async def newSession(self, params):
+            meta = getattr(params, "field_meta", None) or {}
+            should_block = bool(binding_phase and meta.get("fixture_block_binding"))
+            if should_block and binding_phase == "close":
+                state = next(s for s in self._sessions.values()
+                             if s.upstream_session_id == meta["session_id"])
+                original_close = state.plugin_session.aclose
+
+                async def close():
+                    await wait_for_binding_shutdown()
+                    return await original_close()
+
+                state.plugin_session.aclose = close
+            token = block_binding.set(should_block)
+            try:
+                return await super().newSession(params)
+            finally:
+                block_binding.reset(token)
+
         async def aclose(self):
             states = list(self._sessions.values())
             await super().aclose()
             record_lifecycle("adapter_closed", remaining_sessions=len(self._sessions),
                              closed_sessions=all(state._closed for state in states),
                              active_runs=sum(state.run_handle.is_active for state in states))
+            if binding_phase:
+                record_lifecycle("binding_shutdown",
+                    creating=len(self._session_creation_tasks),
+                    binding=len(self._session_bindings_in_progress),
+                    opening=len(self._plugin_runtime._opening),
+                    plugin_sessions=len(self._plugin_runtime._sessions))
 
         async def prompt(self, params):
             text = " ".join(str(getattr(block, "text", block.get("text", "") if isinstance(block, dict) else ""))

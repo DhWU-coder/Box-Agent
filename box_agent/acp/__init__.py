@@ -1222,6 +1222,9 @@ class BoxACPAgent:
         self._system_prompt = system_prompt
         self._sessions: dict[str, SessionState] = {}
         self._session_bindings_in_progress: dict[str, tuple[str, ...]] = {}
+        self._session_creation_tasks: set[asyncio.Task[NewSessionResponse]] = set()
+        self._closing = False
+        self._close_lock = asyncio.Lock()
         self._client_info: ClientInfo | None = None
         self._memory = memory_manager
         self._hooks = hooks
@@ -1252,6 +1255,20 @@ class BoxACPAgent:
 
     async def aclose(self) -> None:
         """Release sessions and application plugins, retaining interrupted owners."""
+        self._closing = True
+        async with self._close_lock:
+            await self._close_sessions()
+
+    async def _close_sessions(self) -> None:
+        # A creation/rebind can own a close lock or an unpublished plugin session.
+        # Settle it before taking a snapshot of sessions to avoid both waiting on
+        # an initializer and racing its removal of a retired handle. These are
+        # adapter-owned tasks, not SDK request tasks that may still send replies.
+        creating = tuple(self._session_creation_tasks)
+        for task in creating:
+            task.cancel()
+        if creating:
+            await asyncio.gather(*creating, return_exceptions=True)
         errors = []
         if self._memory_bootstrap_task is not None:
             self._memory_bootstrap_task.cancel()
@@ -1264,7 +1281,7 @@ class BoxACPAgent:
             if state._closed:
                 if state.agent.session_log is not None:
                     state.agent.session_log.close()
-                del self._sessions[handle]
+                self._sessions.pop(handle, None)
         if self._mcp_finalize_task is not None:
             self._mcp_finalize_task.cancel()
             await asyncio.gather(self._mcp_finalize_task, return_exceptions=True)
@@ -1279,6 +1296,13 @@ class BoxACPAgent:
             from box_agent.session_assembly import combine_cleanup_errors
 
             raise combine_cleanup_errors(errors)
+
+    def _require_accepting_requests(self) -> None:
+        if self._closing:
+            raise RequestError(
+                -32000, "The agent is shutting down and cannot accept new tasks.",
+                {"code": "AGENT_CLOSING"},
+            )
 
     def _llm_for_binding(self, binding: dict[str, Any] | None) -> LLMClient:
         if binding is None:
@@ -1633,6 +1657,16 @@ class BoxACPAgent:
         return resp
 
     async def newSession(self, params: NewSessionRequest) -> NewSessionResponse:
+        self._require_accepting_requests()
+        task = asyncio.create_task(
+            self._new_session_with_binding(params), name="acp-session-create",
+        )
+        self._session_creation_tasks.add(task)
+        # Also release tasks cancelled before their coroutine ever starts.
+        task.add_done_callback(self._session_creation_tasks.discard)
+        return await task
+
+    async def _new_session_with_binding(self, params: NewSessionRequest) -> NewSessionResponse:
         meta = getattr(params, "field_meta", None) or {}
         raw_upstream = meta.get("session_id") if isinstance(meta, dict) else None
         upstream_session_id = raw_upstream.strip() if isinstance(raw_upstream, str) else ""
@@ -1992,7 +2026,7 @@ class BoxACPAgent:
                 await existing_state.aclose()
                 if existing_log is not None:
                     existing_log.close()
-                del self._sessions[existing_handle]
+                self._sessions.pop(existing_handle, None)
                 # The retired handle owned a managed BrowserContext (if it ever
                 # used the browser); release it so it does not linger until
                 # the idle reaper or count against the session cap.
@@ -2369,6 +2403,7 @@ class BoxACPAgent:
         )
 
     async def prompt(self, params: PromptRequest) -> PromptResponse:
+        self._require_accepting_requests()
         session_id = params.sessionId
         if any(session_id in handles for handles in self._session_bindings_in_progress.values()):
             raise _session_busy_error(session_id, rebinding=True)

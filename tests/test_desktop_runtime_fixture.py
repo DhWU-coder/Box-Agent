@@ -199,6 +199,66 @@ async def test_desktop_fixture_closes_resources_when_host_disconnects(mode, shut
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase,existing", [
+    ("close", True), ("browser", True), ("initialization", True),
+    ("initialization", False),
+])
+@pytest.mark.parametrize("shutdown", ["eof", "eof_and_sigterm"])
+async def test_desktop_fixture_shutdown_settles_inflight_session_creation(phase, existing, shutdown):
+    if shutdown != "eof" and os.name == "nt":
+        pytest.skip("Windows terminate() does not deliver a catchable SIGTERM")
+    workspace = Path(__file__).resolve().parents[1] / "workspace"
+    workspace.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="desktop-binding-shutdown-", dir=workspace) as directory:
+        root = Path(directory)
+        probe = AcpHostProbe(
+            command=[sys.executable, "-m", "tests.desktop_runtime_fixture"], cwd=root,
+            env={"BOX_AGENT_DESKTOP_TEST_ROOT": str(root), "BOX_AGENT_HOME": str(root / "profile"),
+                 "BOX_AGENT_DESKTOP_TEST_BINDING_PHASE": phase, "PYTHONUTF8": "1"},
+            timeout_s=10,
+        )
+        await probe.start()
+        process = probe._proc
+        try:
+            await probe.initialize()
+            params = {"cwd": str(root / "profile/workspaces/test"), "mcpServers": []}
+            # Also cover the first anonymous session: it has no product-ID reservation.
+            meta = {"session_id": "shutdown-product"} if existing else {}
+            if existing:
+                await probe.request("session/new", {**params, "_meta": meta})
+            await _send(process, probe._protocol, {
+                "jsonrpc": "2.0", "id": 900, "method": "session/new",
+                "params": {**params, "_meta": {**meta, "fixture_block_binding": True}},
+            })
+
+            async def wait_for_binding():
+                while not (root / "binding-waiting").exists():
+                    assert process.returncode is None
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_binding(), 5)
+            process.stdin.close()
+            if shutdown == "eof_and_sigterm":
+                with suppress(ProcessLookupError):
+                    process.send_signal(signal.SIGTERM)
+            assert await asyncio.wait_for(process.wait(), 5) == 0
+            records = [json.loads(line) for line in (root / "lifecycle.jsonl").read_text().splitlines()]
+            assert sum(r["event"] == "binding_wait_closed" for r in records) == 1
+            assert [r for r in records if r["event"] == "binding_shutdown"] == [{
+                "event": "binding_shutdown", "creating": 0, "binding": 0,
+                "opening": 0, "plugin_sessions": 0,
+            }]
+            assert sum(r["event"] == "adapter_closed" for r in records) == 1
+            assert sum(r["event"] == "llm_closed" for r in records) == 1
+            assert not probe._protocol.parse_errors
+        finally:
+            await probe.stop()
+        assert "KeyError" not in probe.stderr_text
+        assert "Task was destroyed" not in probe.stderr_text
+        assert "Task exception was never retrieved" not in probe.stderr_text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["oversized_stdin", "stdout_pressure"])
 @pytest.mark.parametrize("shutdown", ["eof", "sigterm"])
 async def test_desktop_fixture_exits_after_transport_failure(mode, shutdown):
