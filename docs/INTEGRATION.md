@@ -51,6 +51,10 @@ JSON-RPC 错误 `code=-32010`、`data.code="SESSION_BUSY"`，
 关闭期间的新请求返回 `code=-32000`、`data.code="AGENT_CLOSING"`；
 宿主需要重新启动服务后再发起任务。已有任务的取消和最终状态发送仍在协议连接关闭前处理。
 
+ACP 连接不保存已完成的入站 RPC 正文、响应或异常历史；单个请求的记录随其
+处理任务释放。多会话状态及恢复历史仍由会话对象和 Session Log 管理。
+权限请求等出站 RPC 的等待记录保留至宿主回复或连接关闭，不受入站记录清理影响。
+
 ### 场景 A：用户首次打开应用
 
 1. 宿主侧检测：`MEMORY.md` 是否已存在、各个 CLI 是否已安装、Chromium 是否已通过 `box-agent install-browser` 装好。
