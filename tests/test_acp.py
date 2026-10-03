@@ -2120,6 +2120,168 @@ async def test_session_creation_failure_releases_product_reservation(
         await agent.aclose()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["close", "browser", "initialization"])
+async def test_shutdown_cancels_rebinding_before_releasing_sessions(tmp_path, monkeypatch, phase):
+    import box_agent.session_assembly as assembly
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    request = SimpleNamespace(cwd=str(tmp_path), field_meta={"session_id": "shutdown-rebind"})
+    session = await agent.newSession(request)
+    state = agent._sessions[session.sessionId]
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    if phase == "close":
+        owner, name = state.plugin_session, "aclose"
+    elif phase == "browser":
+        owner, name = acp_module, "close_browser_session"
+    else:
+        owner, name = assembly, "finish_session"
+    original = getattr(owner, name)
+
+    async def blocked(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, blocked)
+    pending = asyncio.create_task(agent.newSession(request))
+    closing = []
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        # Concurrent shutdown callers must not duplicate resource release.
+        closing = [asyncio.create_task(agent.aclose()) for _ in range(2)]
+        _, waiting = await asyncio.wait(closing, timeout=2)
+        assert not waiting, "shutdown did not cancel the pending rebind"
+        await asyncio.gather(*closing)
+        assert cancelled.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not agent._sessions
+        assert not agent._session_bindings_in_progress
+        assert not agent._plugin_runtime._sessions
+        assert not agent._plugin_runtime._opening
+        assert state.agent.session_log._closed
+        assert agent._plugin_runtime._closed
+        await agent.aclose()
+    finally:
+        release.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await asyncio.gather(*closing, return_exceptions=True)
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("product_id", [None, "first-product"])
+async def test_shutdown_settles_initial_creation_and_rejects_new_requests(
+    tmp_path, monkeypatch, product_id
+):
+    import box_agent.session_assembly as assembly
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    entered, cancelling, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = assembly.finish_session
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            await release.wait()
+            raise
+
+    monkeypatch.setattr(assembly, "finish_session", blocked)
+    request = SimpleNamespace(cwd=str(tmp_path), field_meta={"session_id": product_id})
+    pending = asyncio.create_task(agent.newSession(request))
+    closing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        closing = asyncio.create_task(agent.aclose())
+        await asyncio.wait_for(cancelling.wait(), 2)
+        assert not closing.done(), "shutdown must wait for creation rollback"
+        monkeypatch.setattr(assembly, "finish_session", original)
+        for call in (
+            lambda: agent.newSession(SimpleNamespace(cwd=str(tmp_path), field_meta={})),
+            lambda: agent.prompt(SimpleNamespace(
+                sessionId="unknown-handle", prompt=[{"text": "must not auto-create"}],
+            )),
+        ):
+            with pytest.raises(RequestError) as raised:
+                await asyncio.wait_for(call(), 2)
+            assert raised.value.code == -32000
+            assert raised.value.data == {"code": "AGENT_CLOSING"}
+        release.set()
+        await asyncio.wait_for(closing, 2)
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not agent._sessions
+        assert not agent._plugin_runtime._sessions
+        assert not agent._plugin_runtime._opening
+        assert not agent._session_bindings_in_progress
+        with pytest.raises(RequestError) as raised:
+            await agent.newSession(request)
+        assert raised.value.data == {"code": "AGENT_CLOSING"}
+    finally:
+        release.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        if closing is not None:
+            await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 5)
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_before_creation_starts_leaves_no_session_reservations(tmp_path, monkeypatch):
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    entered = asyncio.Event()
+    original = agent._new_session_with_binding
+
+    async def creation(*args, **kwargs):
+        entered.set()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(agent, "_new_session_with_binding", creation)
+    pending = asyncio.create_task(agent.newSession(SimpleNamespace(
+        cwd=str(tmp_path), field_meta={"session_id": "cancel-before-create"},
+    )))
+    try:
+        # Let the request enter; its child creation task has not run yet.
+        await asyncio.sleep(0)
+        await agent.aclose()
+        assert not entered.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not agent._session_creation_tasks
+        assert not agent._session_bindings_in_progress
+        assert not agent._sessions
+        assert not agent._plugin_runtime._sessions
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await agent.aclose()
+
+
 class EmptyFinalAnswerLLM:
     def __init__(self):
         self.calls = 0
