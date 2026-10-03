@@ -30,6 +30,22 @@ wire 格式，但底层共享 core/tool 行为仍可能一致。
 
 ## 典型对接场景
 
+### 同一产品会话的并发请求
+
+`session/new._meta.session_id` 是宿主的稳定产品会话 ID，与返回的 ACP
+`sessionId` 句柄不同。使用相同产品 ID 重建会话时，旧请求必须已彻底结束，
+包括准备（如图片理解）、执行、取消清理和收尾阶段。
+
+若仍有请求占用，`session/new` 与重复的 `session/prompt` 一样，立即返回
+JSON-RPC 错误 `code=-32010`、`data.code="SESSION_BUSY"`，
+`data.sessionId` 指向原 ACP 句柄。拒绝不会关闭原会话或清空其任务状态；
+宿主应等待原请求返回后再重建，发送 `session/cancel` 本身不代表取消已完成。
+
+会话创建/重绑尚未返回期间，同一产品 ID 的另一个 `session/new`，以及发给
+正在被替换的旧句柄的 `session/prompt`，也会立即返回 `SESSION_BUSY`。
+首次创建尚无旧句柄时，错误中不包含 `data.sessionId`。服务端不会排队或自动重试；
+其他产品会话不受此限制。请求结束后可正常重建并恢复历史。
+
 ### 场景 A：用户首次打开应用
 
 1. 宿主侧检测：`MEMORY.md` 是否已存在、各个 CLI 是否已安装、Chromium 是否已通过 `box-agent install-browser` 装好。
