@@ -81,6 +81,7 @@ from box_agent.agent_runtime import (
 from box_agent.agent_run import AgentRunHandle
 from box_agent.api import RunRequest, RunStatus
 from box_agent.acp.stdio_compat import stdio_streams_largebuf
+from box_agent.acp.request_state import RequestStateStore
 from box_agent.agent import (
     Agent,
     goal_autopilot_prompt,
@@ -5723,7 +5724,9 @@ async def run_acp_server(config: Config | None = None) -> None:
             )
             return server_adapter
 
-        connection = AgentSideConnection(create_adapter, writer, reader)
+        connection = AgentSideConnection(
+            create_adapter, writer, reader, state_store=RequestStateStore(),
+        )
 
         log.info("server/ready", message="ACP server ready, listening on stdio")
         _stderr_print("✅ ACP protocol ready; MCP loading continues in background")

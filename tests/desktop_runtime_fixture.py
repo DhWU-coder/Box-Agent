@@ -214,6 +214,20 @@ def install_fixture(acp, root):
             # process never loads credentials or contacts a real provider.
             return self._llm
 
+        async def extMethod(self, method, params):
+            if method == "fixture_rpc_state":
+                store = self._conn._conn._state
+                return {
+                    "incoming_records": len(store._incoming),
+                    "outgoing_requests": len(store._outgoing),
+                    "sessions": {state.upstream_session_id: {
+                        "handle": handle,
+                        "users": [str(message.content) for message in state.agent.messages
+                                  if message.role == "user"],
+                    } for handle, state in self._sessions.items()},
+                }
+            return await super().extMethod(method, params)
+
         async def newSession(self, params):
             meta = getattr(params, "field_meta", None) or {}
             should_block = bool(binding_phase and meta.get("fixture_block_binding"))

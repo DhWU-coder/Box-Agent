@@ -136,6 +136,110 @@ async def test_desktop_fixture_reports_real_run_outcome(mode):
 
 
 @pytest.mark.asyncio
+async def test_request_cleanup_preserves_interleaved_sessions_and_host_permissions():
+    workspace = Path(__file__).resolve().parents[1] / "workspace"
+    workspace.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="desktop-rpc-state-", dir=workspace) as directory:
+        root = Path(directory)
+        probe = AcpHostProbe(
+            command=[sys.executable, "-m", "tests.desktop_runtime_fixture"], cwd=root,
+            env={"BOX_AGENT_DESKTOP_TEST_ROOT": str(root), "BOX_AGENT_HOME": str(root / "profile"),
+                 "PYTHONUTF8": "1"}, timeout_s=10,
+        )
+        await probe.start()
+        process = probe._proc
+
+        async def read_until(predicate):
+            while True:
+                eof, message = await probe._reader.read_frame(deadline=None)
+                assert not eof
+                assert not probe._protocol.parse_errors
+                if message and predicate(message):
+                    return message
+
+        async def waiting_permission(session, request_id):
+            await _send(process, probe._protocol, {
+                "jsonrpc": "2.0", "id": request_id, "method": "session/prompt",
+                "params": {"sessionId": session,
+                           "prompt": [{"type": "text", "text": "fixture:permission"}]},
+            })
+            return await asyncio.wait_for(read_until(
+                lambda m: m.get("method") == "session/request_permission",
+            ), 5)
+
+        try:
+            await probe.initialize()
+            cwd = str(root / "profile/workspaces/test")
+            handles = {}
+            for product in ("a", "b", "c", "d"):
+                handles[product] = await probe.session_new(cwd=cwd, meta={"session_id": product})
+                response = await probe.session_prompt(handles[product], f"fixture:normal seed-{product}")
+                assert response["stopReason"] == "end_turn"
+
+            # Two independent host callbacks remain live while other sessions run.
+            permission_a = await waiting_permission(handles["a"], 900)
+            permission_d = await waiting_permission(handles["d"], 901)
+            assert permission_a["id"] != permission_d["id"]
+            response = await probe.session_prompt(handles["b"], "fixture:normal continuation-b")
+            assert response["stopReason"] == "end_turn"
+            with pytest.raises(RpcError) as raised:
+                await probe.session_prompt(handles["c"], "fixture:oversize")
+            assert raised.value.code == -32603
+            assert (await probe.ext_request("inject", {
+                "sessionId": handles["a"], "text": "supplement-a", "injectionId": "a-1",
+            }))["ok"]
+            state = await probe.ext_request("fixture_rpc_state")
+            assert state["incoming_records"] == 0
+            assert state["outgoing_requests"] == 2
+            assert set(state["sessions"]) == {"a", "b", "c", "d"}
+
+            # Complete in reverse order; approval must reach D, cancellation A.
+            option = next(o["optionId"] for o in permission_d["params"]["options"]
+                          if o["kind"] == "allow_once")
+            await _send(process, probe._protocol, {
+                "jsonrpc": "2.0", "id": permission_d["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": option}},
+            })
+            response = await asyncio.wait_for(read_until(lambda m: m.get("id") == 901), 5)
+            assert response["result"]["stopReason"] == "end_turn"
+            await probe.session_cancel(handles["a"])
+            response = await asyncio.wait_for(read_until(lambda m: m.get("id") == 900), 5)
+            assert response["result"]["stopReason"] == "cancelled"
+            # A host reply arriving after cancellation is harmless and retires its ID.
+            await _send(process, probe._protocol, {
+                "jsonrpc": "2.0", "id": permission_a["id"],
+                "result": {"outcome": {"outcome": "cancelled"}},
+            })
+
+            for index in range(12):
+                product = ("a", "b", "c", "d")[index % 4]
+                old = handles[product]
+                handles[product] = await probe.session_new(cwd=cwd, meta={
+                    "session_id": product, "fixture_payload": "x" * (256 * 1024),
+                })
+                assert handles[product] != old
+                response = await probe.session_prompt(handles[product], f"fixture:normal resumed-{product}")
+                assert response["stopReason"] == "end_turn"
+
+            state = await probe.ext_request("fixture_rpc_state")
+            assert state["incoming_records"] == state["outgoing_requests"] == 0
+            assert len(state["sessions"]) == 4
+            for product, session in state["sessions"].items():
+                assert session["handle"] == handles[product]
+                assert any(f"seed-{product}" in text for text in session["users"])
+                assert any(f"resumed-{product}" in text for text in session["users"])
+                assert not any(f"seed-{peer}" in text for peer in handles if peer != product
+                               for text in session["users"])
+            process.stdin.close()
+            assert await asyncio.wait_for(process.wait(), 5) == 0
+            assert not probe._protocol.parse_errors
+        finally:
+            await probe.stop()
+        assert "Task exception was never retrieved" not in probe.stderr_text
+        assert "Task was destroyed" not in probe.stderr_text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["idle", "permission", "stream_wait"])
 @pytest.mark.parametrize("shutdown", ["eof", "sigterm", "eof_and_sigterm"])
 async def test_desktop_fixture_closes_resources_when_host_disconnects(mode, shutdown):
