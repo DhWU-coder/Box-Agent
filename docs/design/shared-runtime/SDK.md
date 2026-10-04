@@ -49,6 +49,18 @@ async with handle:
 
 流式交付失败会在 `events()` 抛出 `RunDeliveryError` 子类，同时结果中保留结构化错误；仅结果模式检查 `result.error`。稳定错误码：`RUN_EVENT_TOO_LARGE`、`RUN_EVENT_CONSUMER_TIMEOUT`、`RUN_EVENT_DELIVERY_FAILED`。ACP 保留现有线协议，交付异常进入现有请求错误路径。
 
+## ACP 会话与后台服务
+
+ACP 后台 Bash 服务的归属以当前 adapter 实例和宿主 `_meta.session_id` 为边界。
+在同一 runtime 内，以相同产品会话 ID、相同工作目录重新调用 `session/new` 后，
+新 ACP 句柄仍可通过原 `bash_id` 查看或停止 `lifetime=runtime` 的服务；重绑创建
+失败或取消后重试也沿用该归属。没有产品会话 ID 的会话仍各自独立，不同 adapter
+实例不会因产品 ID 相同而共享服务。既有工作目录校验和跨会话访问校验继续生效。
+稳定归属仅适用于 Bash；Python 沙箱继续使用 ACP 句柄隔离内核。
+`lifetime=turn` 仍在轮次结束时回收，runtime 服务仍在显式停止或 runtime 退出时
+回收。本归属不持久化，不承诺 runtime 重启后恢复进程，也不增加 ACP 字段或要求
+宿主修改接口；更新已安装客户端的行为仍需要替换并重启其实际运行的 runtime。
+
 ## 容量与权限
 
 `RunDeliveryOptions` 默认 `max_events=1024`、`max_bytes=4194304`、`congestion_timeout_seconds=30`。统计完整事件 envelope 的紧凑 JSON UTF-8 大小，包括编号字段；每个入队事件计算一次。两项积压均降到 50% 且待写事件可放入时恢复。上限只覆盖通道积压，不是进程总内存上限；序列化临时对象、模型内部缓冲和结果聚合另外占用内存。

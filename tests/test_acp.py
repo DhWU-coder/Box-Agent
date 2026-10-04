@@ -55,7 +55,7 @@ from box_agent.runtime import invoke_tool_with_permissions
 from box_agent.schema import FunctionCall, LLMResponse, StreamEvent, TokenUsage, ToolCall
 from box_agent.session_log import SessionLog, SessionLogWorkspaceMismatch
 from box_agent.tools.base import Tool, ToolResult
-from box_agent.tools.bash_tool import BackgroundShellManager
+from box_agent.tools.bash_tool import BackgroundShell, BackgroundShellManager
 from box_agent.tools.jupyter_tool import MAX_EXECUTE_CODE_CHARS
 from box_agent.tools.skill_loader import SKILL_SLOT_SENTINEL, SkillLoader
 from box_agent.tools.skill_tool import create_skill_tools
@@ -3782,6 +3782,186 @@ async def test_acp_prompt_keeps_runtime_http_service_reachable_after_turn_end(
             pytest.fail("runtime HTTP service did not remain reachable after turn end")
     finally:
         await BackgroundShellManager.terminate_owner(session.sessionId)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell command quoting")
+@pytest.mark.parametrize("failed_rebind", [None, "error", "cancelled", "workspace"])
+async def test_rebound_product_session_can_manage_original_runtime_service(
+    tmp_path, monkeypatch, failed_rebind,
+):
+    import box_agent.session_assembly as assembly
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=3, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    request = SimpleNamespace(cwd=str(tmp_path), field_meta={"session_id": "service"})
+    first = await agent.newSession(request)
+    original_tools = agent._sessions[first.sessionId].agent.tools
+    peer = await agent.newSession(SimpleNamespace(
+        cwd=str(tmp_path), field_meta={"session_id": "peer"},
+    ))
+    peer_tools = agent._sessions[peer.sessionId].agent.tools
+    try:
+        service = await original_tools["bash"].execute(
+            command="echo ready; sleep 30", run_in_background=True, lifetime="runtime",
+        )
+        assert service.success
+        shell = BackgroundShellManager.get(service.bash_id)
+        for _ in range(100):
+            if "ready" in shell.output_lines:
+                break
+            await asyncio.sleep(0.02)
+        assert "ready" in shell.output_lines
+
+        if failed_rebind in {"error", "cancelled"}:
+            original_finish = assembly.finish_session
+
+            async def fail(*args, **kwargs):
+                # This point is after the old ACP handle has been removed.
+                assert first.sessionId not in agent._sessions
+                if failed_rebind == "cancelled":
+                    raise asyncio.CancelledError()
+                raise RuntimeError("replacement initialization failed")
+
+            monkeypatch.setattr(assembly, "finish_session", fail)
+            error = asyncio.CancelledError if failed_rebind == "cancelled" else RuntimeError
+            with pytest.raises(error):
+                await agent.newSession(request)
+            monkeypatch.setattr(assembly, "finish_session", original_finish)
+            assert shell.process.returncode is None
+            with pytest.raises(SessionLogWorkspaceMismatch):
+                await agent.newSession(SimpleNamespace(
+                    cwd=str(tmp_path / "other"), field_meta=request.field_meta,
+                ))
+        elif failed_rebind == "workspace":
+            with pytest.raises(SessionLogWorkspaceMismatch):
+                await agent.newSession(SimpleNamespace(
+                    cwd=str(tmp_path / "other"), field_meta=request.field_meta,
+                ))
+            assert shell.process.returncode is None
+
+        previous_handle = first.sessionId
+        for _ in range(3):
+            rebound = await agent.newSession(request)
+            assert rebound.sessionId != previous_handle
+            state = agent._sessions[rebound.sessionId]
+            tools = state.agent.tools
+            # Exercise the model-facing exposure as well as direct execution.
+            offered = state.agent.mcp_tool_exposure.prepare_tools(
+                list(tools.values())
+            ).offered_names
+            assert {"bash_output", "bash_kill"} <= offered
+            output = await tools["bash_output"].execute(bash_id=service.bash_id)
+            assert output.success
+            assert output.lifetime == "runtime"
+            assert shell.process.returncode is None
+            previous_handle = rebound.sessionId
+
+        # An ordinary turn on the replacement must still clean only turn tasks.
+        turn = await tools["bash"].execute(command="sleep 30", run_in_background=True)
+        assert turn.success
+        turn_shell = BackgroundShellManager.get(turn.bash_id)
+        response = await agent.prompt(SimpleNamespace(
+            sessionId=rebound.sessionId, prompt=[{"text": "continue"}],
+        ))
+        assert response.stopReason == "end_turn"
+        assert BackgroundShellManager.get(turn.bash_id) is None
+        assert turn_shell.process.returncode is not None
+        assert shell.process.returncode is None
+
+        for name in ("bash_output", "bash_kill"):
+            denied = await peer_tools[name].execute(bash_id=service.bash_id)
+            assert not denied.success
+        assert shell.process.returncode is None
+        stopped = await tools["bash_kill"].execute(bash_id=service.bash_id)
+        assert stopped.success
+        assert shell.process.returncode is not None
+        assert BackgroundShellManager.get(service.bash_id) is None
+    finally:
+        await original_tools["bash"].cleanup_background_processes()
+        await peer_tools["bash"].cleanup_background_processes()
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rebinding_does_not_expose_previous_handles_python_kernels(tmp_path, monkeypatch):
+    from box_agent.tools.jupyter_tool import JupyterSandboxTool
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    request = SimpleNamespace(cwd=str(tmp_path), field_meta={"session_id": "python"})
+    try:
+        first = await agent.newSession(request)
+        old_tool = agent._sessions[first.sessionId].agent.tools["execute_code"]
+        monkeypatch.setattr(JupyterSandboxTool, "_sessions", {
+            old_tool._session_key("analysis"): SimpleNamespace(
+                is_alive=lambda: True, workspace=tmp_path,
+            ),
+        })
+        assert old_tool.get_status()["total_sessions"] == 1
+
+        rebound = await agent.newSession(request)
+        new_tool = agent._sessions[rebound.sessionId].agent.tools["execute_code"]
+        assert new_tool.get_status()["total_sessions"] == 0
+        assert new_tool.process_owner_id == rebound.sessionId
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_session", ["product", "anonymous", "adapter"])
+async def test_background_service_remains_private_to_its_product_and_adapter(
+    tmp_path, other_session, monkeypatch,
+):
+    # Ownership is platform independent; a managed record suffices to prove
+    # foreign tools cannot read it or reach its termination method.
+    from unittest.mock import AsyncMock
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False),
+    )
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+    other = (BoxACPAgent(DummyConn(), config, DoneLLM(), [], "system")
+             if other_session == "adapter" else agent)
+    request = SimpleNamespace(
+        cwd=str(tmp_path), field_meta={} if other_session == "anonymous" else {"session_id": "a"},
+    )
+    try:
+        first = await agent.newSession(request)
+        owner = agent._sessions[first.sessionId].agent.tools["bash"].process_owner_id
+        shell = BackgroundShell("private", "synthetic", SimpleNamespace(returncode=None),
+                                0, owner_id=owner, lifetime="runtime")
+        shell.add_output("private output")
+        shell.terminate = AsyncMock()
+        monkeypatch.setattr(BackgroundShellManager, "_shells", {shell.bash_id: shell})
+        if other_session == "adapter":
+            # Close the durable log lock; runtime services intentionally outlive
+            # individual AgentSessions. A new adapter must not inherit them.
+            await agent.aclose()
+        second = await other.newSession(SimpleNamespace(
+            cwd=str(tmp_path),
+            field_meta={"session_id": "b"} if other_session == "product" else request.field_meta,
+        ))
+        tools = other._sessions[second.sessionId].agent.tools
+        for name in ("bash_output", "bash_kill"):
+            result = await tools[name].execute(bash_id=shell.bash_id)
+            assert not result.success
+            assert "Available: none" in result.error
+        assert shell.last_read_index == 0
+        shell.terminate.assert_not_awaited()
+    finally:
+        await other.aclose()
+        await agent.aclose()
 
 
 @pytest.mark.asyncio

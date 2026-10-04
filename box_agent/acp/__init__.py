@@ -39,7 +39,7 @@ from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
 from typing import Any
-from uuid import uuid4
+from uuid import uuid4, uuid5
 
 from acp import (
     PROTOCOL_VERSION,
@@ -107,6 +107,8 @@ from box_agent.tools.skill_execution_env import bind_user_source_text
 from box_agent.tools.bash_tool import (
     BASH_LIFETIME_TURN,
     BackgroundShellManager,
+    BashKillTool,
+    BashOutputTool,
     BashTool,
 )
 from box_agent.tools.file_tools import WriteTool
@@ -1222,6 +1224,9 @@ class BoxACPAgent:
         self._base_tools = base_tools
         self._system_prompt = system_prompt
         self._sessions: dict[str, SessionState] = {}
+        # Background services belong to a product session within this adapter,
+        # not its replaceable ACP handle. No per-session owner cache is needed.
+        self._process_owner_namespace = uuid4()
         self._session_bindings_in_progress: dict[str, tuple[str, ...]] = {}
         self._session_creation_tasks: set[asyncio.Task[NewSessionResponse]] = set()
         self._closing = False
@@ -1704,6 +1709,10 @@ class BoxACPAgent:
         # session — the task caches its result.
         await self._ensure_skills_loaded()
         session_id = f"sess-{len(self._sessions)}-{uuid4().hex[:8]}"
+        bash_process_owner_id = (
+            f"acp-{uuid5(self._process_owner_namespace, upstream_session_id).hex}"
+            if upstream_session_id else session_id
+        )
         workspace = Path(params.cwd or self._config.agent.workspace_dir).expanduser()
         if not workspace.is_absolute():
             workspace = workspace.resolve()
@@ -2157,6 +2166,11 @@ class BoxACPAgent:
         session_skill_loader = state.skill_loader
         tools = list(agent.tools.values())
         for tool in tools:
+            # Keep Bash ownership across a rebind while other process-backed
+            # tools (notably Python kernels) remain handle-scoped.
+            if (isinstance(tool, (BashTool, BashOutputTool, BashKillTool))
+                    and tool.process_owner_id == session_id):
+                tool.process_owner_id = bash_process_owner_id
             if isinstance(tool, SkillHubInstallTool):
                 tool._skill_loader = session_skill_loader
 

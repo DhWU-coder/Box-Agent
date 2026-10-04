@@ -2040,7 +2040,9 @@ class BashKillTool(Tool):
 
         except ValueError as e:
             # Shell not found
-            available_ids = BackgroundShellManager.get_available_ids()
+            available_ids = BackgroundShellManager.get_available_ids(
+                self.process_owner_id
+            )
             return BashOutputResult(
                 success=False,
                 error=f"{str(e)}. Available: {available_ids or 'none'}",
