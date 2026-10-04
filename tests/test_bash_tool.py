@@ -901,6 +901,22 @@ async def test_background_processes_are_scoped_and_cleaned_by_owner():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["a", "b", None])
+async def test_bash_kill_missing_shell_lists_only_callers_available_ids(monkeypatch, owner):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(BackgroundShellManager, "_shells", {
+        "a-shell": SimpleNamespace(owner_id="a"),
+        "b-shell": SimpleNamespace(owner_id="b"),
+    })
+    result = await BashKillTool(process_owner_id=owner).execute(bash_id="missing")
+
+    assert not result.success
+    expected = ["a-shell", "b-shell"] if owner is None else [f"{owner}-shell"]
+    assert result.error == f"Shell not found: missing. Available: {expected}"
+
+
+@pytest.mark.asyncio
 async def test_turn_cleanup_preserves_runtime_background_process():
     tool = BashTool(process_owner_id="session-lifetimes")
     turn_process = await tool.execute(
