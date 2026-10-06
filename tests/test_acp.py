@@ -937,6 +937,103 @@ async def test_acp_session_update_send_times_out(tmp_path):
         await agent._send("session-1", update_agent_message(text_block("hello")))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("log_format", ["text", "json"])
+async def test_acp_event_send_failure_logs_original_error_and_continues(
+    tmp_path, monkeypatch, capsys, log_format,
+):
+    from box_agent.acp.debug_logger import ACPDebugLogger
+
+    monkeypatch.setenv("BOX_AGENT_LOG_LEVEL", "error")
+    monkeypatch.setenv("BOX_AGENT_LOG_FORMAT", log_format)
+    monkeypatch.delenv("BOX_AGENT_LOG_FILE", raising=False)
+    monkeypatch.setattr(acp_module, "log", ACPDebugLogger())
+
+    class FailOnceConn(DummyConn):
+        failed = False
+
+        async def sessionUpdate(self, payload):
+            if payload.update.sessionUpdate == "agent_message_chunk" and not self.failed:
+                self.failed = True
+                raise OSError("fixture notification failure")
+            await super().sessionUpdate(payload)
+
+    class ChunkedLLM(DoneLLM):
+        async def generate_stream(self, messages, tools=None, **_):
+            yield StreamEvent(type="text", delta="before failure")
+            yield StreamEvent(type="text", delta="after failure")
+            yield StreamEvent(type="finish", finish_reason="stop")
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False),
+    )
+    conn = FailOnceConn()
+    agent = BoxACPAgent(conn, config, ChunkedLLM(), [], "system")
+    session = await agent.newSession(
+        SimpleNamespace(cwd=None, field_meta={"session_mode": "general"})
+    )
+    capsys.readouterr()
+    response = await agent.prompt(
+        SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": "hello"}])
+    )
+
+    assert conn.failed
+    assert response.stopReason == "end_turn"
+    assert response.field_meta["ok"] is True
+    assert any(
+        getattr(getattr(update.update, "content", None), "text", "") == "after failure"
+        for update in conn.updates
+    )
+    continued = await agent.prompt(
+        SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": "continue"}])
+    )
+    assert continued.field_meta["ok"] is True
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    if log_format == "json":
+        record = json.loads(captured.err)
+        assert record["event"] == "event/error"
+        assert record["event_type"] == "ContentEvent"
+        assert record["session_id"] == session.sessionId
+        assert record["error"] == "fixture notification failure"
+        assert "OSError: fixture notification failure" in record["traceback"]
+    else:
+        assert "[ERROR] event/error" in captured.err
+        assert "event_type=ContentEvent" in captured.err
+        assert f"session_id={session.sessionId}" in captured.err
+        assert "OSError: fixture notification failure" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_acp_event_send_timeout_remains_terminal(tmp_path):
+    class HangingContentConn(DummyConn):
+        async def sessionUpdate(self, payload):
+            if payload.update.sessionUpdate == "agent_message_chunk":
+                await asyncio.Event().wait()
+            await super().sessionUpdate(payload)
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+        tools=ToolsConfig(enable_sub_agent=False),
+    )
+    agent = BoxACPAgent(HangingContentConn(), config, DoneLLM(), [], "system")
+    agent._SESSION_UPDATE_TIMEOUT_SECONDS = 0.01
+    session = await agent.newSession(
+        SimpleNamespace(cwd=None, field_meta={"session_mode": "general"})
+    )
+
+    with pytest.raises(TimeoutError, match="ACP session update timed out"):
+        await agent.prompt(
+            SimpleNamespace(sessionId=session.sessionId, prompt=[{"text": "hello"}])
+        )
+    state = agent._sessions[session.sessionId]
+    assert not state._prompt_in_progress
+    assert not state.run_handle.is_active
+
+
 def test_sandbox_prompt_requires_execute_code_for_explicit_python_results():
     assert "用户要求“用/使用/运行 Python”得到一个具体结果" in SANDBOX_INFO_PROMPT
     assert "必须调用 `execute_code` 返回真实执行结果" in SANDBOX_INFO_PROMPT
