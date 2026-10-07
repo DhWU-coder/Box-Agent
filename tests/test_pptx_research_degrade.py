@@ -273,6 +273,10 @@ def test_prepare_with_hard_issue_is_non_terminal_then_falls_back(tmp_path, monke
     second = _prepare(tmp_path)  # unchanged outline: terminal fallback, never blocked
     assert second.get("terminal") is True and second.get("status") == "degraded"
     assert "79" not in (tmp_path / "outline.json").read_text(encoding="utf8")
+    # The concrete disclosure travels with the terminal fallback result and its report.
+    assert second["auto_degraded"] is True and second["degraded"] and second["unverified_claims"]
+    delivery_report = json.loads((tmp_path / "qa/design_delivery.json").read_text(encoding="utf8"))
+    assert delivery_report["auto_degraded"] is True and delivery_report["unverified_claims"]
 
 
 def test_fixing_the_hard_issue_lets_prepare_continue(tmp_path, monkeypatch):
@@ -355,3 +359,20 @@ def test_degrade_never_ships_the_claim_when_other_contracts_block_removal(tmp_pa
     assert "2011" not in text  # the unsupported number never survives
     assert report["auto_degraded"] is True
     assert code == 0 or report.get("degraded_unvalidated") is True
+
+
+def test_new_missing_evidence_after_a_degrade_updates_the_disclosure(tmp_path):
+    _degrade(tmp_path, _outline())
+    edited = json.loads((tmp_path / "outline.json").read_text(encoding="utf8"))
+    edited["slides"][2]["evidence"] = []
+    edited["slides"][2]["message"] = "国家队组织核心"
+    edited["slides"][2]["bullets"] = ["巴西队的主要组织核心"]
+    _write(tmp_path, edited)
+    code, report = _run(tmp_path)
+    assert code == 0 and report["auto_degraded"] is True and "repair_required" not in report
+    assert any(item.get("slide") == "slide-03" and item.get("path") == "evidence"
+               for item in report["unverified_claims"])
+    assert any(item.get("slide") == "slide-02" for item in report["degraded"])  # earlier disclosure kept
+    _, again = _run(tmp_path)  # repeated prepares are idempotent
+    assert again["unverified_claims"] == report["unverified_claims"]
+    assert again["degraded"] == report["degraded"]

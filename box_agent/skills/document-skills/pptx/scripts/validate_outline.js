@@ -1036,10 +1036,11 @@ function main() {
       // Reflect the outline as it is now, so a mid-repair check shows what is still open.
       repair_checklist: buildRepairChecklist(outline, result.repairable),
     };
-  } else if (opts.repairFlow && previous && previous.auto_degraded && strictResearchEnabled(opts)
-    && (result.repairable || []).some(finding => finding.kind !== "missing_evidence")) {
-    // Degraded once already, then the outline was edited again: degrade what is new,
-    // keep the earlier disclosure, never open another repair round.
+  } else if (opts.repairFlow && previous && previous.auto_degraded && repairableCount > 0
+    && strictResearchEnabled(opts)) {
+    // Degraded once already, then the outline was edited again: degrade what is new and
+    // recompute the disclosure for the current content (merged and deduplicated with the
+    // earlier one, so repeated prepares are idempotent); never open another repair round.
     const applied = applyDegrade(outline, resolved, opts, previous.attempt || attempt, previous);
     result = applied.result;
     repairState = applied.state;

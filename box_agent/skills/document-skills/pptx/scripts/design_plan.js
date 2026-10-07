@@ -196,6 +196,17 @@ function main() {
       const delivery = require("./design_recovery.js").fallback(baseline, root,
         `Outline validation incomplete; inspect ${report}. Content is not verified.`);
       require("./artifact_delivery.js").publishArtifact(delivery.primary_artifact);
+      // Carry the concrete degradation disclosure into the terminal fallback result and report.
+      if (hardReport.auto_degraded) {
+        const disclosure = { auto_degraded: true, degraded: hardReport.degraded,
+          unverified_claims: hardReport.unverified_claims,
+          disclose: "Tell the user which claims were removed or left unverified." };
+        Object.assign(delivery, disclosure);
+        const deliveryReport = path.join(root, "qa", "design_delivery.json");
+        try {
+          write(deliveryReport, { ...JSON.parse(fs.readFileSync(deliveryReport, "utf8")), ...disclosure });
+        } catch (_error) { /* the printed result still carries the disclosure */ }
+      }
       console.log(JSON.stringify(delivery));
       return;
     }
