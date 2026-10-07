@@ -1034,6 +1034,122 @@ async def test_acp_event_send_timeout_remains_terminal(tmp_path):
     assert not state.run_handle.is_active
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_operation", ["scan", "read"])
+async def test_slow_skill_validation_keeps_other_acp_updates_and_control_responsive(
+    tmp_path, monkeypatch, slow_operation,
+):
+    import threading
+
+    from box_agent.skill_runtime import SkillRuntime
+
+    path = tmp_path / "skills" / "demo" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\nname: demo\ndescription: example\n---\nVERIFIED_METHOD\n")
+    tools, loader = create_skill_tools(sources=[(tmp_path / "skills", "user")])
+    config = Config(llm=LLMConfig(api_key="test-key"),
+                    agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+                    tools=ToolsConfig(enable_sub_agent=False))
+    conn = DummyConn()
+    agent = BoxACPAgent(conn, config, DoneLLM(), tools, "system", skill_loader=loader)
+    first = await agent.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general"}))
+    second = await agent.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general"}))
+    # Seed an actual source-verified snapshot, without recording a delivery.
+    await SkillRuntime(loader).avalidate_references(("demo",))
+    loader.validation_timeout_seconds = 0.05
+    agent._sessions[first.sessionId].agent.skill_runtime.validation_timeout_seconds = 0.05
+    entered, release = threading.Event(), threading.Event()
+    if slow_operation == "scan":
+        original = loader._source_signature
+
+        def slow(entry):
+            entered.set()
+            assert release.wait(3)
+            return original(entry)
+
+        monkeypatch.setattr(loader, "_source_signature", slow)
+    else:
+        original = loader.read_skill_bytes
+
+        def slow(file):
+            assert threading.current_thread() is not threading.main_thread(), "Skill read blocked the event loop"
+            entered.set()
+            assert release.wait(3)
+            return original(file)
+
+        monkeypatch.setattr(loader, "read_skill_bytes", slow)
+
+    prompt = asyncio.create_task(agent.prompt(SimpleNamespace(
+        sessionId=first.sessionId, prompt=[{"text": "/demo task"}],
+    )))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        await asyncio.wait_for(agent._send(second.sessionId, update_agent_message(text_block("other session"))), 0.5)
+        await asyncio.wait_for(agent.cancel(SimpleNamespace(sessionId=second.sessionId)), 0.5)
+        response = await asyncio.wait_for(prompt, 1)
+        assert response.stopReason == "end_turn"
+        assert response.field_meta["ok"] is True, response.field_meta
+        assert any("VERIFIED_METHOD" in str(message.content)
+                   for message in agent._sessions[first.sessionId].agent.messages)
+        assert agent._SESSION_UPDATE_TIMEOUT_SECONDS == 15.0
+    finally:
+        release.set()
+        if not prompt.done():
+            prompt.cancel()
+        await asyncio.gather(prompt, return_exceptions=True)
+        if loader._validation_task is not None:
+            await asyncio.wait_for(asyncio.shield(loader._validation_task), 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True])
+async def test_acp_session_creation_and_restore_do_not_scan_skills_on_event_loop(tmp_path, monkeypatch, resume):
+    import threading
+
+    monkeypatch.setattr(acp_module, "state_path", lambda relative: tmp_path / "profile" / relative)
+    path = tmp_path / "skills" / "demo" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\nname: demo\ndescription: example\n---\nMETHOD\n")
+    tools, loader = create_skill_tools(sources=[(tmp_path / "skills", "user")])
+    config = Config(llm=LLMConfig(api_key="test-key"),
+                    agent=AgentConfig(max_steps=1, workspace_dir=str(tmp_path)),
+                    tools=ToolsConfig(enable_sub_agent=False, enable_mcp=False))
+    agent = BoxACPAgent(DummyConn(), config, DoneLLM(), tools, "system", skill_loader=loader)
+    control = await agent.newSession(SimpleNamespace(cwd=None, field_meta={"session_mode": "general"}))
+    request = SimpleNamespace(cwd=None, field_meta={"session_mode": "general", "session_id": "restore-demo"})
+    if resume:
+        previous = await agent.newSession(request)
+        state = agent._sessions[previous.sessionId]
+        state.agent.skill_runtime.read("demo")
+        state.agent.session_log.close()
+    entered, release = threading.Event(), threading.Event()
+    original = loader._source_signature
+
+    def scan(entry):
+        assert threading.current_thread() is not threading.main_thread(), "Skill scan blocked session creation"
+        entered.set()
+        assert release.wait(4)
+        return original(entry)
+
+    monkeypatch.setattr(loader, "_source_signature", scan)
+    creation = asyncio.create_task(agent.newSession(request))
+    try:
+        if resume:
+            assert await asyncio.to_thread(entered.wait, 1)
+        await asyncio.wait_for(agent._send(control.sessionId, update_agent_message(text_block("control"))), 0.5)
+        await asyncio.wait_for(agent.cancel(SimpleNamespace(sessionId=control.sessionId)), 0.5)
+        response = await asyncio.wait_for(creation, 3)
+        assert response.sessionId
+    finally:
+        release.set()
+        await asyncio.gather(creation, return_exceptions=True)
+        if loader._validation_task is not None:
+            await asyncio.wait_for(asyncio.shield(loader._validation_task), 2)
+        for state in agent._sessions.values():
+            if state.agent.session_log is not None:
+                state.agent.session_log.close()
+
+
 def test_sandbox_prompt_requires_execute_code_for_explicit_python_results():
     assert "用户要求“用/使用/运行 Python”得到一个具体结果" in SANDBOX_INFO_PROMPT
     assert "必须调用 `execute_code` 返回真实执行结果" in SANDBOX_INFO_PROMPT

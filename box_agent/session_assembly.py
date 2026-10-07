@@ -126,7 +126,7 @@ async def prepare_memory(resources: SessionResources) -> None:
         ))
 
 
-def _bind_skill_runtime(resources: SessionResources) -> None:
+async def _bind_skill_runtime(resources: SessionResources) -> None:
     from .agent_service import AgentService
     from .skill_runtime import SkillRuntime
 
@@ -143,7 +143,7 @@ def _bind_skill_runtime(resources: SessionResources) -> None:
             session_log = resources.context.host.session_log
             if session_log is None:
                 raise ValueError("resume_session_log requires a borrowed SessionLog")
-            runtime.restore_records(session_log.replay().skills)
+            await runtime.arestore_records(session_log.replay().skills)
             session_log.prepare_resume()
 
 
@@ -174,11 +174,11 @@ async def prepare_tools(resources: SessionResources) -> None:
     resources.mcp_task, resources.skill_task = host.mcp_task, host.skill_task
     if host.tools is not None:
         resources.tools = host.tools
-        _bind_skill_runtime(resources)
+        await _bind_skill_runtime(resources)
         return
     expert = resources.state.get("expert_context")
     if expert is not None and resources.skill_loader is not None:
-        resources.skill_loader = resources.skill_loader.with_expert_skill_sources(expert.skill_names())
+        resources.skill_loader = await resources.skill_loader.awith_expert_skill_sources(expert.skill_names())
     runtime_context = resources.state.get("skill_runtime_context") or build_skill_runtime_context(
         sandbox_mode=options.sandbox_mode,
         env_context=resources.state.get("env_context"),
@@ -189,7 +189,7 @@ async def prepare_tools(resources: SessionResources) -> None:
     )
     if options.utility:
         resources.tools = []
-        _bind_skill_runtime(resources)
+        await _bind_skill_runtime(resources)
         return
     from .tools.setup import add_workspace_tools, initialize_base_tools
     from .tools.permissions import CapabilityPolicy, GrantStore
@@ -274,7 +274,7 @@ async def prepare_tools(resources: SessionResources) -> None:
         skill_runtime_context=runtime_context, skill_loader=resources.skill_loader,
         skill_scratch_dir=scratch,
     )
-    _bind_skill_runtime(resources)
+    await _bind_skill_runtime(resources)
     if scratch is not None:
         from .tools.skill_scratch import cleanup_skill_scratch_dir
 
@@ -394,7 +394,7 @@ async def finish_session(session: Any, resources: SessionResources) -> None:
     if grants is not None and session_skill_loader is not None:
         # Agent has already validated and restored the session's read records.
         # Derive the compatibility grant set without restoring a second time.
-        for name in agent.skill_runtime.active_names:
+        for name in agent.skill_runtime.current_active_names:
             skill = session_skill_loader.get_skill(name)
             if skill is not None and getattr(skill, "source", None) == "connector":
                 grants.add(skill.name)
@@ -416,7 +416,7 @@ async def finish_session(session: Any, resources: SessionResources) -> None:
         )
         selector.bind(agent.messages[0].content)
         if expert_context:
-            expert_skill_prompt = selector.update(expert_context.skill_query())
+            expert_skill_prompt = selector.update(expert_context.skill_query(), refresh=False)
             if expert_skill_prompt is not None:
                 agent.set_system_prompt(expert_skill_prompt)
         session.skill_selector = selector

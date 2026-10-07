@@ -59,6 +59,11 @@ class AgentService:
 
         if not isinstance(request, RunRequest):
             raise TypeError("request must be a RunRequest")
+        runtime = getattr(session.agent, "skill_runtime", None)
+        validation = (await runtime.avalidate_references(runtime.selected_names)
+                      if runtime is not None and request.user_message is not None else None)
+        # Source I/O happens before the ownership checks. Everything from the
+        # checks through runner reservation remains synchronous.
         if getattr(session, "_closed", False) or getattr(session, "_closing", False):
             raise RuntimeError("agent session is closed")
         current_handle = getattr(session, "_run_handle", None)
@@ -107,7 +112,11 @@ class AgentService:
         # No await between the ownership check and runner reservation: another
         # start cannot append history or replace this handle in that interval.
         if request.user_message is not None:
-            session.agent.add_user_message(request.user_message)
+            if validation is not None:
+                with runtime.reference_scope(validation):
+                    session.agent.add_user_message(request.user_message)
+            else:
+                session.agent.add_user_message(request.user_message)
             grant_store = getattr(session, "grant_store", None)
             if grant_store is not None:
                 grant_store.clear_prompt_grants()

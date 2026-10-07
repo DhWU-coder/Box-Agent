@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -200,19 +201,31 @@ class AgentSession:
         try:
             plugins = await runtime.open_session(context)
             resources = plugins.resources
-            session = cls.create(
-                config=config,
-                agent_factory=agent_factory,
-                llm_client=resources.llm_client,
-                system_prompt=resources.system_prompt,
-                tools=resources.tools,
-                workspace_dir=context.workspace,
-                token_limit=options.token_limit,
-                hooks=resources.hooks,
-                session_log=context.host.session_log,
-                utility=options.utility,
-                **resources.state,
-            )
+            skill_runtime = resources.state.get("skill_runtime")
+            restore_validation = None
+            session_log = context.host.session_log
+            replay = getattr(session_log, "replay", None)
+            if skill_runtime is not None and skill_runtime.loader is not None and callable(replay):
+                records = replay().skills
+                names = tuple(dict.fromkeys(row["name"] for row in records
+                                            if isinstance(row, dict) and isinstance(row.get("name"), str)))
+                restore_validation = await skill_runtime.loader.avalidate_references(names, allow_stale=False)
+            scope = (skill_runtime.reference_scope(restore_validation)
+                     if restore_validation is not None else nullcontext())
+            with scope:
+                session = cls.create(
+                    config=config,
+                    agent_factory=agent_factory,
+                    llm_client=resources.llm_client,
+                    system_prompt=resources.system_prompt,
+                    tools=resources.tools,
+                    workspace_dir=context.workspace,
+                    token_limit=options.token_limit,
+                    hooks=resources.hooks,
+                    session_log=context.host.session_log,
+                    utility=options.utility,
+                    **resources.state,
+                )
             session.plugin_session = plugins
             session._owns_plugin_runtime = owns_runtime
             plugins.owner = session

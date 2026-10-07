@@ -35,6 +35,7 @@ from ..events import (
 )
 from ..llm.model_routing import resolve_model_client
 from ..schema import Message
+from ..skill_dependencies import SkillDependencyError
 from ..session_log import SessionLog, SessionLogDurabilityError
 from .base import EventEmittingTool, Tool, ToolInvocationContext, ToolResult
 from .schema_validation import ToolArgumentIssue
@@ -1505,10 +1506,22 @@ class SubAgentTool(EventEmittingTool):
         if isinstance(parsed, CapabilityFailure):
             return self._failure_result(parsed)
 
+        skill_loader = self._resolve_skill_loader()
+        if parsed.skill_names and skill_loader is not None:
+            validation = await skill_loader.avalidate_references(tuple(parsed.skill_names), allow_stale=False)
+            for name in parsed.skill_names:
+                try:
+                    validation.resolve(name)
+                except SkillDependencyError as exc:
+                    return self._failure_result(CapabilityFailure(
+                        code=exc.code, message=exc.message, retryable=True, details=exc.details,
+                    ), parsed)
+            skill_loader = validation.catalog
         resolved = CapabilityResolver().resolve(
             parsed,
             parent_tools=live_tools,
-            skill_loader=self._resolve_skill_loader(),
+            skill_loader=skill_loader,
+            refresh_skills=False,
             skill_access_filter=self._skill_access_filter,
             capability_state=self._resolve_capability_state(),
             permission_negotiator_available=self._permission_negotiator is not None,

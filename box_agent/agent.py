@@ -495,7 +495,7 @@ class Agent:
         self.local_tool_exposure = LocalToolExposurePolicy(
             lambda: self.tools,
             goal_provider=lambda: getattr(self, "goal", None),
-            active_skills_provider=lambda: self.skill_runtime.active_names,
+            active_skills_provider=lambda: self.skill_runtime.current_active_names,
         )
         self.mcp_tool_exposure: MCPToolExposureManager | None = None
         if enable_builtin_tools:
@@ -831,6 +831,11 @@ class Agent:
                     "the previous compact commit could not be replayed; refusing to continue"
                 ) from exc
 
+    async def aadd_user_message(self, content: str) -> None:
+        validation = await self.skill_runtime.avalidate_references(self.skill_runtime.selected_names)
+        with self.skill_runtime.reference_scope(validation):
+            self.add_user_message(content)
+
     def add_user_message(self, content: str) -> None:
         """Add a user message and materialize selected Skills beside it."""
         self._restore_session_surface_after_replay_failure()
@@ -1087,7 +1092,7 @@ class Agent:
             self._persist_active_skills()
         if self._pending_skill_restore:
             pending = self._pending_skill_restore
-            self.skill_runtime.restore_records(pending)
+            await self.skill_runtime.arestore_records(pending)
             self._pending_skill_restore = []
             # ACP may deliberately drop records whose source is unavailable.
             # That is a partial restore, not an explicit user clear; keep the
