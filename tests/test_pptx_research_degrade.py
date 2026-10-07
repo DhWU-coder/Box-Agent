@@ -286,3 +286,72 @@ def test_fixing_the_hard_issue_lets_prepare_continue(tmp_path, monkeypatch):
     third = _prepare(tmp_path)
     assert third["ok"] is True and third.get("repair_required") is not True
     assert (tmp_path / "design_input.json").exists()
+
+
+def _degrade(tmp_path, outline):
+    _write(tmp_path, outline)
+    _, first = _run(tmp_path)
+    code, second = _run(tmp_path)
+    return first, code, second, json.loads((tmp_path / "outline.json").read_text(encoding="utf8"))
+
+
+def test_unsupported_numbers_are_stripped_from_title_and_message(tmp_path):
+    outline = _outline()
+    outline["slides"][3]["title"] = "总结 2026"
+    outline["slides"][3]["message"] = "2026年的创造力代表"
+    _, code, report, slides = _degrade(tmp_path, outline)
+    assert code == 0 and report["auto_degraded"] is True
+    last = slides["slides"][3]
+    assert "2026" not in last["title"] and "2026" not in last["message"] and last["title"].strip()
+    actions = {item["action"] for item in report["degraded"]}
+    assert {"stripped_unsupported_numbers_from_title", "stripped_unsupported_numbers_from_message"} <= actions
+
+
+def test_claims_added_after_a_degrade_are_degraded_too(tmp_path):
+    _degrade(tmp_path, _outline())
+    edited = json.loads((tmp_path / "outline.json").read_text(encoding="utf8"))
+    edited["slides"][3]["bullets"] = ["技术辨识度高", "2030年再夺冠"]
+    _write(tmp_path, edited)
+    code, report = _run(tmp_path)
+    assert code == 0 and report["auto_degraded"] is True and "repair_required" not in report
+    assert "2030" not in (tmp_path / "outline.json").read_text(encoding="utf8")
+    assert any(item.get("path") == "bullets.1" and item.get("slide") == "slide-04"
+               for item in report["unverified_claims"])
+    assert any(item["slide"] == "slide-02" for item in report["degraded"])  # first pass disclosure kept
+
+
+def test_factual_slide_without_evidence_gets_a_repair_item(tmp_path):
+    outline = _outline()
+    outline["slides"][1]["evidence"] = []
+    outline["slides"][1]["bullets"] = ["在桑托斯完成青训"]
+    _write(tmp_path, outline)
+    code, report = _run(tmp_path)
+    assert code == 0 and report["repair_required"] is True
+    entry = next(item for item in report["repair_checklist"] if item["slide"] == "slide-02")
+    assert entry["missing_evidence"]
+    assert all(item["slide"] != "slide-01" and item["slide"] != "slide-04"  # cover/closing are exempt
+               for item in report["repair_checklist"] if item.get("missing_evidence"))
+
+
+def test_discarded_evidence_leaves_qualitative_claims_disclosed(tmp_path):
+    outline = _outline()
+    outline["slides"][1]["bullets"] = ["在桑托斯完成青训"]
+    outline["slides"][1]["evidence"] = ["青训资料 | Santos | 官方资料"]  # no URL, no numbers
+    _, code, report, _ = _degrade(tmp_path, outline)
+    assert code == 0 and report["auto_degraded"] is True
+    assert any(item.get("path") == "evidence" and item.get("slide") == "slide-02"
+               for item in report["unverified_claims"])
+
+
+def test_degrade_never_ships_the_claim_when_other_contracts_block_removal(tmp_path):
+    outline = _outline()
+    outline["slides"][3] = {
+        "page": 4, "title": "议程", "message": "本次分享三个部分", "layout": "agenda",
+        "visual": "3 个议程项列表", "bullets": ["2011年桑托斯", "巴塞罗那", "国家队"],
+        "evidence": [], "notes": "",
+    }
+    _, code, report, slides = _degrade(tmp_path, outline)
+    text = json.dumps(slides, ensure_ascii=False)
+    assert "2011" not in text  # the unsupported number never survives
+    assert report["auto_degraded"] is True
+    assert code == 0 or report.get("degraded_unvalidated") is True

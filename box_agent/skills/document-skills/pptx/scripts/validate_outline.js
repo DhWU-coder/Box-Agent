@@ -326,6 +326,13 @@ function isStructuralEvidenceExemptSlide(slide, index) {
   ]);
 }
 
+// Closing/summary pages restate earlier sourced claims; they are not queued for repair.
+function isClosingSlide(slide) {
+  return includesAny(`${slide && slide.layout || ""} ${slide && slide.visual || ""}`, [
+    "closing", "summary", "thank", "结尾", "总结", "结语", "致谢",
+  ]);
+}
+
 const ASSUMPTION_EVIDENCE_RE = /假设|示意|假定|assum(?:e|ed|ption)|illustrative|hypothetical/i;
 const UNAVAILABLE_FACT_PLACEHOLDER_RE = /未提供|未给出|待补充|待确认|缺失|未知|暂无可验证公开数据|not\s+provided|not\s+supplied|missing|unknown|tbd|no\s+verifiable\s+public\s+data/i;
 const FRAMEWORK_UNAVAILABLE_FACT_PLACEHOLDER = "暂无可验证公开数据";
@@ -553,6 +560,7 @@ function validate(outline, opts) {
             "verified_facts canonical item unless a required fact is explicitly unavailable"
           );
         } else {
+          if (!isClosingSlide(slide)) repairable.push({ kind: "missing_evidence", slide: index });
           warnings.push(
             `${label}: public-authoritative research requires at least one ` +
             "claim | source | http(s) URL evidence item on every slide unless the " +
@@ -762,6 +770,12 @@ function buildRepairChecklist(outline, repairable) {
       });
     }
     const entry = bySlide.get(finding.slide);
+    if (finding.kind === "missing_evidence") {
+      entry.missing_evidence =
+        "No evidence on a factual slide: add an evidence item with the exact page URL for its key " +
+        `facts, or use ${UNVERIFIED_PLACEHOLDER} for a required fact it cannot support.`;
+      return;
+    }
     if (finding.kind === "evidence_url") {
       entry.evidence_without_url.push({
         path: `evidence.${finding.evidence}`,
@@ -781,6 +795,7 @@ function buildRepairChecklist(outline, repairable) {
   return Array.from(bySlide.values()).map(entry => {
     if (!entry.evidence_without_url.length) delete entry.evidence_without_url;
     if (!entry.claims.length) delete entry.claims;
+    if (!entry.missing_evidence) delete entry.missing_evidence;
     return entry;
   });
 }
@@ -796,6 +811,8 @@ const REPAIR_HOW_TO_FIX = [
     `"桑托斯一线队首秀"), or use ${UNVERIFIED_PLACEHOLDER} for a required field. ` +
     "Never invent a URL or a figure.",
   "Evidence without URL: replace it with the exact page URL you read (not a homepage), or delete it.",
+  "No evidence on a factual slide: add an evidence item with the exact page URL for its key facts, or use " +
+    `${UNVERIFIED_PLACEHOLDER} for a required fact it cannot support; qualitative pages that stay without evidence are listed as unverified.`,
   "Apply all items in one write_file of outline.json, then re-run the same prepare command.",
 ];
 
@@ -841,28 +858,60 @@ function trimUnsupportedNumbers(value, unsupported) {
   return result;
 }
 
-// Applies the one-time automatic degradation: drop evidence without a source URL,
-// then trim unsupported numbers from bullets (gentle) or remove/replace the bullets
-// whose numbers the remaining evidence cannot back (strict, or when trimming leaves
-// nothing meaningful). Title/message numbers are only reported, never rewritten.
-function degradeUnsupportedClaims(outline, { gentle = true } = {}) {
+// Removes unsupported number tokens (with their unit) from a title/message line.
+function stripUnsupportedNumberTokens(value, unsupported) {
+  let result = String(text(value));
+  unsupported(result).forEach(token => {
+    const bare = String(token).replace(/%$/, "");
+    const pattern = new RegExp(`${bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(?:%|年度|赛季|年|月|日|号|次|个|万|亿)?`, "gu");
+    result = result.replace(pattern, " ");
+  });
+  return result.replace(/\s{2,}/g, " ").replace(/^[\s：:，,、\-–—|]+|[\s：:，,、\-–—|]+$/gu, "").trim();
+}
+
+// Applies the automatic degradation: drop evidence without a source URL, strip
+// unsupported numbers from title/message, and trim, remove or placeholder the bullets
+// whose numbers the remaining evidence cannot back. mode: "gentle" (trim clauses),
+// "strict" (remove bullets) or "placeholder" (replace in place, keeps bullet counts).
+function degradeUnsupportedClaims(outline, { mode = "gentle" } = {}) {
   const degraded = [];
   const unverifiedClaims = [];
   (outline.slides || []).forEach((slide, index) => {
     const label = slideLabel(index);
+    let discardedEvidence = false;
     if (Array.isArray(slide.evidence)) {
       const kept = slide.evidence.filter(item => {
         if (!text(item) || hasHttpUrl(item)) return true;
         degraded.push({ slide: label, action: "dropped_evidence_without_url", value: text(item) });
+        discardedEvidence = true;
         return false;
       });
       slide.evidence = kept;
+    }
+    if (discardedEvidence && !slide.evidence.length) {
+      unverifiedClaims.push({
+        slide: label, path: "evidence",
+        note: "evidence without a page URL was discarded; the claims on this slide are unverified",
+      });
+    }
+    if (!(slide.evidence || []).length && !isClosingSlide(slide) && !isStructuralEvidenceExemptSlide(slide, index)
+      && !discardedEvidence
+      && !UNAVAILABLE_FACT_PLACEHOLDER_RE.test([slide.title, slide.message, ...(slide.bullets || [])].map(text).join(" "))) {
+      unverifiedClaims.push({ slide: label, path: "evidence", note: "no evidence on a factual slide; its claims are unverified" });
     }
     const evidenceNumbers = new Set(numberTokens((slide.evidence || []).join(" ")));
     const unsupported = value => numberTokens(value).filter(token => !evidenceNumbers.has(token));
     ["title", "message"].forEach(field => {
       const tokens = unsupported(slide[field]);
-      if (tokens.length) unverifiedClaims.push({ slide: label, path: field, numbers: tokens });
+      if (!tokens.length) return;
+      const claim = { slide: label, path: field, numbers: tokens };
+      const stripped = stripUnsupportedNumberTokens(slide[field], unsupported);
+      const fallback = field === "title" ? "概览" : UNVERIFIED_PLACEHOLDER;
+      const next = meaningfulLength(stripped) >= 2 && !unsupported(stripped).length ? stripped : fallback;
+      claim.kept_as = next;
+      slide[field] = next;
+      degraded.push({ slide: label, action: `stripped_unsupported_numbers_from_${field}` });
+      unverifiedClaims.push(claim);
     });
     if (Array.isArray(slide.bullets)) {
       slide.bullets.forEach((bullet, bulletIndex) => {
@@ -873,12 +922,18 @@ function degradeUnsupportedClaims(outline, { gentle = true } = {}) {
       });
       const keep = [];
       let trimmed = 0;
+      let placeholdered = 0;
       slide.bullets.forEach((bullet, bulletIndex) => {
         if (unsupported(bullet).length === 0) {
           keep.push(bullet);
           return;
         }
-        const rewritten = gentle ? trimUnsupportedNumbers(bullet, unsupported) : null;
+        if (mode === "placeholder") {
+          keep.push(UNVERIFIED_PLACEHOLDER);
+          placeholdered += 1;
+          return;
+        }
+        const rewritten = mode === "gentle" ? trimUnsupportedNumbers(bullet, unsupported) : null;
         if (rewritten) {
           keep.push(rewritten);
           trimmed += 1;
@@ -887,6 +942,7 @@ function degradeUnsupportedClaims(outline, { gentle = true } = {}) {
         }
       });
       if (trimmed > 0) degraded.push({ slide: label, action: "trimmed_unsupported_numbers", count: trimmed });
+      if (placeholdered > 0) degraded.push({ slide: label, action: "replaced_bullets_with_placeholder", count: placeholdered });
       const removed = slide.bullets.length - keep.length;
       if (removed > 0) {
         if (keep.length === 0) keep.push(UNVERIFIED_PLACEHOLDER);
@@ -897,10 +953,44 @@ function degradeUnsupportedClaims(outline, { gentle = true } = {}) {
           count: removed,
         });
       }
-      if (removed > 0 || trimmed > 0) slide.bullets = keep;
+      if (removed > 0 || trimmed > 0 || placeholdered > 0) slide.bullets = keep;
     }
   });
   return { degraded, unverifiedClaims };
+}
+
+// Degrades the current outline in place (backup of the first original is kept) and returns the
+// repair state plus the validation result of what is now on disk. Never leaves a claim unchanged:
+// gentle -> strict -> placeholder; if even that does not validate, the placeholder copy is still
+// written and the failed recheck is returned so prepare delivers the terminal fallback.
+const dedupe = items => Array.from(new Map(items.map(item => [JSON.stringify(item), item])).values());
+
+function applyDegrade(outline, resolved, opts, attempt, previous) {
+  const backup = path.join(path.dirname(resolved), "qa", "outline.before_degrade.json");
+  let chosen = null;
+  for (const mode of ["gentle", "strict", "placeholder"]) {
+    const working = JSON.parse(JSON.stringify(outline));
+    const { degraded, unverifiedClaims } = degradeUnsupportedClaims(working, { mode });
+    const recheck = validate(working, opts);
+    chosen = { working, degraded, unverifiedClaims, recheck, mode };
+    if (recheck.ok) break;
+  }
+  fs.mkdirSync(path.dirname(backup), { recursive: true });
+  if (!fs.existsSync(backup)) fs.writeFileSync(backup, `${JSON.stringify(outline, null, 2)}\n`);
+  fs.writeFileSync(resolved, `${JSON.stringify(chosen.working, null, 2)}\n`);
+  const prior = previous && previous.auto_degraded ? previous : {};
+  return {
+    // Whatever is left is disclosed through unverified_claims; nothing remains to repair.
+    result: { ...chosen.recheck, repairable: [] },
+    state: {
+      attempt,
+      auto_degraded: true,
+      ...(chosen.recheck.ok ? {} : { degraded_unvalidated: true }),
+      degraded: dedupe([...(prior.degraded || []), ...chosen.degraded]),
+      unverified_claims: dedupe([...(prior.unverified_claims || []), ...chosen.unverifiedClaims]),
+      backup,
+    },
+  };
 }
 
 function readPreviousReport(reportPath) {
@@ -946,12 +1036,19 @@ function main() {
       // Reflect the outline as it is now, so a mid-repair check shows what is still open.
       repair_checklist: buildRepairChecklist(outline, result.repairable),
     };
+  } else if (opts.repairFlow && previous && previous.auto_degraded && strictResearchEnabled(opts)
+    && (result.repairable || []).some(finding => finding.kind !== "missing_evidence")) {
+    // Degraded once already, then the outline was edited again: degrade what is new,
+    // keep the earlier disclosure, never open another repair round.
+    const applied = applyDegrade(outline, resolved, opts, previous.attempt || attempt, previous);
+    result = applied.result;
+    repairState = applied.state;
   } else if (previous && previous.auto_degraded) {
-    // Already degraded once: keep the disclosure, never open another repair round —
-    // neither after a later prepare nor after a standalone check rewrote the report.
+    // Keep the disclosure on standalone checks and clean follow-up prepares.
     repairState = {
       attempt: previous.attempt,
       auto_degraded: true,
+      ...(previous.degraded_unvalidated ? { degraded_unvalidated: true } : {}),
       degraded: previous.degraded,
       unverified_claims: previous.unverified_claims,
       backup: previous.backup,
@@ -972,28 +1069,23 @@ function main() {
       repair_checklist: buildRepairChecklist(outline, result.repairable || []),
     };
   } else if (opts.repairFlow && strictResearchEnabled(opts) && !result.ok && repairableCount > 0) {
-    // Hard issues send prepare straight to fallback delivery, so no repair round can
-    // happen. Still never ship unsupported numbers: degrade them now (validity of the
-    // rest is unchanged and reported through result.issues as before).
-    const backup = path.join(path.dirname(resolved), "qa", "outline.before_degrade.json");
-    const working = JSON.parse(JSON.stringify(outline));
-    const { degraded, unverifiedClaims } = degradeUnsupportedClaims(working);
-    fs.mkdirSync(path.dirname(backup), { recursive: true });
-    fs.writeFileSync(backup, `${JSON.stringify(outline, null, 2)}\n`);
-    fs.writeFileSync(resolved, `${JSON.stringify(working, null, 2)}\n`);
-    repairState = { attempt, auto_degraded: true, degraded_with_hard_issues: true, degraded, unverified_claims: unverifiedClaims, backup };
+    // Second hard-issue round: the fallback delivery follows, so never ship unsupported claims.
+    const applied = applyDegrade(outline, resolved, opts, attempt, previous);
+    result = applied.result;
+    repairState = { ...applied.state, degraded_with_hard_issues: true };
   } else if (opts.repairFlow && strictResearchEnabled(opts) && result.ok && repairableCount > 0) {
     if (attempt === 1) {
       const checklist = buildRepairChecklist(outline, result.repairable);
       const claimCount = checklist.reduce((sum, entry) =>
-        sum + (entry.claims || []).length + (entry.evidence_without_url || []).length, 0);
+        sum + (entry.claims || []).length + (entry.evidence_without_url || []).length
+        + (entry.missing_evidence ? 1 : 0), 0);
       repairState = {
         repair_required: true,
         attempt,
         repair_instructions:
           `Outline is not ready for design: ${claimCount} item(s) on ${checklist.length} slide(s) ` +
-          "state numbers/dates that the slide's own evidence does not contain, or cite evidence " +
-          "without a page URL (see repair_checklist). Fix every item in outline.json now, then re-run " +
+          "state numbers/dates that the slide's own evidence does not contain, cite evidence " +
+          "without a page URL, or carry factual claims with no evidence (see repair_checklist). Fix every item in outline.json now, then re-run " +
           "the same prepare command. Items left unfixed are cut from the slides before design: " +
           "the unsupported numbers and the clauses or bullets carrying them are deleted, so those " +
           `slides come out shorter, vaguer, or only show ${UNVERIFIED_PLACEHOLDER}. ` +
@@ -1002,25 +1094,9 @@ function main() {
         repair_checklist: checklist,
       };
     } else {
-      const backup = path.join(path.dirname(resolved), "qa", "outline.before_degrade.json");
-      let working = JSON.parse(JSON.stringify(outline));
-      let { degraded, unverifiedClaims } = degradeUnsupportedClaims(working);
-      let recheck = validate(working, opts);
-      if (!recheck.ok) {
-        // Trimmed lines can trip other checks; fall back to whole-bullet removal.
-        working = JSON.parse(JSON.stringify(outline));
-        ({ degraded, unverifiedClaims } = degradeUnsupportedClaims(working, { gentle: false }));
-        recheck = validate(working, opts);
-      }
-      if (recheck.ok) {
-        fs.mkdirSync(path.dirname(backup), { recursive: true });
-        fs.writeFileSync(backup, `${JSON.stringify(outline, null, 2)}\n`);
-        fs.writeFileSync(resolved, `${JSON.stringify(working, null, 2)}\n`);
-        result = recheck;
-        repairState = { attempt, auto_degraded: true, degraded, unverified_claims: unverifiedClaims, backup };
-      } else {
-        repairState = { attempt, auto_degraded: false, degrade_skipped: "degraded outline failed validation; original kept", unverified_claims: unverifiedClaims };
-      }
+      const applied = applyDegrade(outline, resolved, opts, attempt, previous);
+      result = applied.result;
+      repairState = applied.state;
     }
   }
   const output = {
