@@ -107,7 +107,7 @@ function usage() {
   console.error(
     "Usage: validate_outline.js outline.json [--min-slides N] " +
     "[--max-slides N] [--research-handoff research/qa/topic_research_check.json] " +
-    "[--report qa/outline_check.json]"
+    "[--report qa/outline_check.json] [--no-strict-research] [--repair-flow]"
   );
   process.exit(2);
 }
@@ -137,6 +137,11 @@ function parseArgs(argv) {
     } else if (arg === "--report" && value) {
       opts.report = value;
       i += 1;
+    } else if (arg === "--no-strict-research") {
+      opts.noStrictResearch = true;
+    } else if (arg === "--repair-flow") {
+      // Passed only by design_plan.js prepare; a standalone check never spends the repair round.
+      opts.repairFlow = true;
     } else if (["--research-handoff", "--research-report"].includes(arg) && value) {
       // --research-report remains a compatibility alias for existing sessions.
       opts.researchHandoff = value;
@@ -329,6 +334,8 @@ const PRIVATE_IDENTITY_FACT_RE = /(?:融资(?:阶段|轮次)|(?:种子|天使|�
 function validate(outline, opts) {
   const issues = [];
   const warnings = [];
+  // Unsourced public-research claims: fixable once by the model, then degraded.
+  const repairable = [];
   const publicResearch = isPublicResearchOutline(outline);
   const verifiedResearch = opts.verifiedResearch;
 
@@ -591,6 +598,7 @@ function validate(outline, opts) {
         labels.push(label);
         evidenceUsage.set(key, labels);
         if (publicResearch && !hasHttpUrl(item)) {
+          repairable.push({ kind: "evidence_url", slide: index, evidence: evidenceIndex });
           warnings.push(
             `${label}: evidence.${evidenceIndex} must include the actual http(s) ` +
             "source URL used for this public-research claim; do not relabel an " +
@@ -626,6 +634,7 @@ function validate(outline, opts) {
         claimEntries.forEach(entry => {
           numberTokens(entry.value).forEach(token => {
             if (!evidenceNumbers.has(token)) {
+              repairable.push({ kind: "number", slide: index, path: entry.path, token });
               warnings.push(
                 `${label}: ${entry.path} numeric literal ${JSON.stringify(token)} ` +
                 "is not present in this page's evidence; add an exact evidence fact " +
@@ -727,7 +736,184 @@ function validate(outline, opts) {
     }
   });
 
-  return { ok: issues.length === 0, issues, warnings, slideCount: slides.length };
+  return { ok: issues.length === 0, issues, warnings, slideCount: slides.length, repairable };
+}
+
+const UNVERIFIED_PLACEHOLDER = "暂无可验证公开数据";
+
+function slideLabel(index) {
+  return `slide-${String(index + 1).padStart(2, "0")}`;
+}
+
+// Groups repairable findings per slide with the original text and the slide's
+// current evidence, so the model gets an actionable list instead of bare indexes.
+function buildRepairChecklist(outline, repairable) {
+  const slides = Array.isArray(outline.slides) ? outline.slides : [];
+  const bySlide = new Map();
+  (repairable || []).forEach(finding => {
+    const slide = slides[finding.slide] || {};
+    if (!bySlide.has(finding.slide)) {
+      bySlide.set(finding.slide, {
+        slide: slideLabel(finding.slide),
+        title: text(slide.title),
+        current_evidence: (Array.isArray(slide.evidence) ? slide.evidence : []).map(text).filter(Boolean),
+        claims: [],
+        evidence_without_url: [],
+      });
+    }
+    const entry = bySlide.get(finding.slide);
+    if (finding.kind === "evidence_url") {
+      entry.evidence_without_url.push({
+        path: `evidence.${finding.evidence}`,
+        text: text((slide.evidence || [])[finding.evidence]),
+      });
+      return;
+    }
+    let claim = entry.claims.find(item => item.path === finding.path);
+    if (!claim) {
+      const [field, bulletIndex] = String(finding.path).split(".");
+      const value = field === "bullets" ? (slide.bullets || [])[Number(bulletIndex)] : slide[field];
+      claim = { path: finding.path, text: text(value), unsupported_numbers: [] };
+      entry.claims.push(claim);
+    }
+    if (!claim.unsupported_numbers.includes(finding.token)) claim.unsupported_numbers.push(finding.token);
+  });
+  return Array.from(bySlide.values()).map(entry => {
+    if (!entry.evidence_without_url.length) delete entry.evidence_without_url;
+    if (!entry.claims.length) delete entry.claims;
+    return entry;
+  });
+}
+
+const REPAIR_HOW_TO_FIX = [
+  "Page already read: if a page you opened in this task states the figure/date, write that exact " +
+    "figure/date into this slide's evidence item next to its page URL, e.g. " +
+    "\"2013年加盟巴塞罗那 | FC Barcelona | https://...\". Every number in title/message/bullets must " +
+    "appear literally in the same slide's evidence text; one fact per evidence item.",
+  "Not sourced yet: web_search with a plain query (no site:), then web_extract the specific page " +
+    "and cite that exact page URL. At most two targeted searches per claim; then stop searching.",
+  "Cannot source it: reword the line without the number but keep its point (e.g. \"2009：桑托斯首秀\" -> " +
+    `"桑托斯一线队首秀"), or use ${UNVERIFIED_PLACEHOLDER} for a required field. ` +
+    "Never invent a URL or a figure.",
+  "Evidence without URL: replace it with the exact page URL you read (not a homepage), or delete it.",
+  "Apply all items in one write_file of outline.json, then re-run the same prepare command.",
+];
+
+const HARD_ISSUE_HOW_TO_FIX = [
+  "\"appears data-heavy but visual does not name a chart/table/KPI/dashboard data display\": rewrite " +
+    "that slide's `visual` to name the display, e.g. \"KPI 卡片 + 折线图\", \"对比表格\", \"柱状图\", or " +
+    "reduce the slide to fewer than two distinct figures.",
+  "\"message duplicates title/another message\": make `message` a one-sentence claim, not the title.",
+  "Missing top-level fields or wrong slide counts: add the field or adjust `slides` as the issue says.",
+  "Apply all fixes in one write_file of outline.json, then re-run the same prepare command.",
+];
+
+const DATE_PREFIX_RE = /^\s*(?:截至|自|从|于|在|约)?\s*\d{4}(?:\s*[\/／-]\s*\d{2,4})?\s*(?:年|赛季|年度)?\s*(?:\d{1,2}\s*月)?\s*(?:\d{1,2}\s*日)?\s*(?:起|以来|时|初|底|末|中)?\s*(?:的)?\s*[：:，,、\-–—]?\s*/u;
+const CLAUSE_SPLIT_RE = /([，,；;。：:]|\s[-–—|]\s)/u;
+
+function meaningfulLength(value) {
+  return Array.from(String(value || "").replace(/[\s\p{P}\p{S}]/gu, "")).length;
+}
+
+// Gentle degradation for one line: drop only the clauses (or leading date phrases)
+// that carry unsupported numbers. Returns null when nothing meaningful survives.
+// The result never keeps a number that the slide's evidence does not contain.
+function trimUnsupportedNumbers(value, unsupported) {
+  const parts = String(text(value)).split(CLAUSE_SPLIT_RE);
+  const kept = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    let clause = parts[i];
+    if (unsupported(clause).length) {
+      const stripped = clause.replace(DATE_PREFIX_RE, "");
+      clause = stripped !== clause && !unsupported(stripped).length && meaningfulLength(stripped) >= 2
+        ? stripped : "";
+    }
+    if (meaningfulLength(clause) === 0) {
+      // "资料更新：2026年10月" — a label whose value was dropped means nothing on its own.
+      const last = kept[kept.length - 1];
+      if (last && last.index === i - 2 && /^[：:]$/u.test(parts[i - 1] || "")) kept.pop();
+      continue;
+    }
+    kept.push({ index: i, delimiter: kept.length ? parts[i - 1] : "", clause: clause.trim() });
+  }
+  const result = kept.map(item => `${item.delimiter || ""}${item.clause}`).join("").trim();
+  if (meaningfulLength(result) < 4 || unsupported(result).length) return null;
+  return result;
+}
+
+// Applies the one-time automatic degradation: drop evidence without a source URL,
+// then trim unsupported numbers from bullets (gentle) or remove/replace the bullets
+// whose numbers the remaining evidence cannot back (strict, or when trimming leaves
+// nothing meaningful). Title/message numbers are only reported, never rewritten.
+function degradeUnsupportedClaims(outline, { gentle = true } = {}) {
+  const degraded = [];
+  const unverifiedClaims = [];
+  (outline.slides || []).forEach((slide, index) => {
+    const label = slideLabel(index);
+    if (Array.isArray(slide.evidence)) {
+      const kept = slide.evidence.filter(item => {
+        if (!text(item) || hasHttpUrl(item)) return true;
+        degraded.push({ slide: label, action: "dropped_evidence_without_url", value: text(item) });
+        return false;
+      });
+      slide.evidence = kept;
+    }
+    const evidenceNumbers = new Set(numberTokens((slide.evidence || []).join(" ")));
+    const unsupported = value => numberTokens(value).filter(token => !evidenceNumbers.has(token));
+    ["title", "message"].forEach(field => {
+      const tokens = unsupported(slide[field]);
+      if (tokens.length) unverifiedClaims.push({ slide: label, path: field, numbers: tokens });
+    });
+    if (Array.isArray(slide.bullets)) {
+      slide.bullets.forEach((bullet, bulletIndex) => {
+        const tokens = unsupported(bullet);
+        if (tokens.length) {
+          unverifiedClaims.push({ slide: label, path: `bullets.${bulletIndex}`, numbers: tokens, bullet: text(bullet) });
+        }
+      });
+      const keep = [];
+      let trimmed = 0;
+      slide.bullets.forEach((bullet, bulletIndex) => {
+        if (unsupported(bullet).length === 0) {
+          keep.push(bullet);
+          return;
+        }
+        const rewritten = gentle ? trimUnsupportedNumbers(bullet, unsupported) : null;
+        if (rewritten) {
+          keep.push(rewritten);
+          trimmed += 1;
+          const claim = unverifiedClaims.find(item => item.slide === label && item.path === `bullets.${bulletIndex}`);
+          if (claim) claim.kept_as = rewritten;
+        }
+      });
+      if (trimmed > 0) degraded.push({ slide: label, action: "trimmed_unsupported_numbers", count: trimmed });
+      const removed = slide.bullets.length - keep.length;
+      if (removed > 0) {
+        if (keep.length === 0) keep.push(UNVERIFIED_PLACEHOLDER);
+        degraded.push({
+          slide: label,
+          action: keep.length === 1 && keep[0] === UNVERIFIED_PLACEHOLDER
+            ? "replaced_bullets_with_placeholder" : "removed_unsupported_bullets",
+          count: removed,
+        });
+      }
+      if (removed > 0 || trimmed > 0) slide.bullets = keep;
+    }
+  });
+  return { degraded, unverifiedClaims };
+}
+
+function readPreviousReport(reportPath) {
+  if (!reportPath) return null;
+  try {
+    return JSON.parse(fs.readFileSync(resolveArtifactPath(reportPath), "utf8"));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function strictResearchEnabled(opts) {
+  return !opts.noStrictResearch && process.env.BOX_AGENT_PPT_STRICT_RESEARCH !== "0";
 }
 
 function main() {
@@ -742,8 +928,103 @@ function main() {
   }
   opts.verifiedResearch = readPresentationHandoff(opts.researchHandoff);
   const { outline, resolved } = readOutline(opts.outlinePath);
-  const result = validate(outline, opts);
+  let result = validate(outline, opts);
+  // Strict-once, then degrade: the first run asks the model to fix unsourced claims
+  // (non-blocking, ok stays true); a later run on the same report degrades them
+  // automatically so the deck is never stalled by a topic that cannot be sourced.
+  const repairableCount = (result.repairable || []).length;
+  const previous = readPreviousReport(opts.report);
+  const attempt = previous && previous.repair_required ? (previous.attempt || 1) + 1 : 1;
+  let repairState = {};
+  if (!opts.repairFlow && previous && previous.repair_required) {
+    // Standalone check: keep the pending repair round intact for the next prepare.
+    repairState = {
+      repair_required: previous.repair_required,
+      attempt: previous.attempt,
+      repair_instructions: previous.repair_instructions,
+      repair_how_to_fix: previous.repair_how_to_fix,
+      // Reflect the outline as it is now, so a mid-repair check shows what is still open.
+      repair_checklist: buildRepairChecklist(outline, result.repairable),
+    };
+  } else if (previous && previous.auto_degraded) {
+    // Already degraded once: keep the disclosure, never open another repair round —
+    // neither after a later prepare nor after a standalone check rewrote the report.
+    repairState = {
+      attempt: previous.attempt,
+      auto_degraded: true,
+      degraded: previous.degraded,
+      unverified_claims: previous.unverified_claims,
+      backup: previous.backup,
+    };
+  } else if (opts.repairFlow && !result.ok && !(previous && previous.repair_required)) {
+    // First hard-issue round: ask for one fix instead of jumping to the neutral fallback.
+    // The follow-up prepare (attempt 2) falls through to the terminal fallback delivery.
+    repairState = {
+      repair_required: true,
+      repair_round: "hard_issues",
+      attempt: 1,
+      repair_instructions:
+        `Outline has ${result.issues.length} structural issue(s) that block the designed layout ` +
+        "(see repair_hard_issues). Fix every one in outline.json now, then re-run the same prepare command. " +
+        "Left unfixed, the deck is built from a neutral layout without the designed theme and no PPTX export.",
+      repair_hard_issues: result.issues,
+      repair_how_to_fix: HARD_ISSUE_HOW_TO_FIX,
+      repair_checklist: buildRepairChecklist(outline, result.repairable || []),
+    };
+  } else if (opts.repairFlow && strictResearchEnabled(opts) && !result.ok && repairableCount > 0) {
+    // Hard issues send prepare straight to fallback delivery, so no repair round can
+    // happen. Still never ship unsupported numbers: degrade them now (validity of the
+    // rest is unchanged and reported through result.issues as before).
+    const backup = path.join(path.dirname(resolved), "qa", "outline.before_degrade.json");
+    const working = JSON.parse(JSON.stringify(outline));
+    const { degraded, unverifiedClaims } = degradeUnsupportedClaims(working);
+    fs.mkdirSync(path.dirname(backup), { recursive: true });
+    fs.writeFileSync(backup, `${JSON.stringify(outline, null, 2)}\n`);
+    fs.writeFileSync(resolved, `${JSON.stringify(working, null, 2)}\n`);
+    repairState = { attempt, auto_degraded: true, degraded_with_hard_issues: true, degraded, unverified_claims: unverifiedClaims, backup };
+  } else if (opts.repairFlow && strictResearchEnabled(opts) && result.ok && repairableCount > 0) {
+    if (attempt === 1) {
+      const checklist = buildRepairChecklist(outline, result.repairable);
+      const claimCount = checklist.reduce((sum, entry) =>
+        sum + (entry.claims || []).length + (entry.evidence_without_url || []).length, 0);
+      repairState = {
+        repair_required: true,
+        attempt,
+        repair_instructions:
+          `Outline is not ready for design: ${claimCount} item(s) on ${checklist.length} slide(s) ` +
+          "state numbers/dates that the slide's own evidence does not contain, or cite evidence " +
+          "without a page URL (see repair_checklist). Fix every item in outline.json now, then re-run " +
+          "the same prepare command. Items left unfixed are cut from the slides before design: " +
+          "the unsupported numbers and the clauses or bullets carrying them are deleted, so those " +
+          `slides come out shorter, vaguer, or only show ${UNVERIFIED_PLACEHOLDER}. ` +
+          "Re-running prepare without editing outline.json does not fix anything.",
+        repair_how_to_fix: REPAIR_HOW_TO_FIX,
+        repair_checklist: checklist,
+      };
+    } else {
+      const backup = path.join(path.dirname(resolved), "qa", "outline.before_degrade.json");
+      let working = JSON.parse(JSON.stringify(outline));
+      let { degraded, unverifiedClaims } = degradeUnsupportedClaims(working);
+      let recheck = validate(working, opts);
+      if (!recheck.ok) {
+        // Trimmed lines can trip other checks; fall back to whole-bullet removal.
+        working = JSON.parse(JSON.stringify(outline));
+        ({ degraded, unverifiedClaims } = degradeUnsupportedClaims(working, { gentle: false }));
+        recheck = validate(working, opts);
+      }
+      if (recheck.ok) {
+        fs.mkdirSync(path.dirname(backup), { recursive: true });
+        fs.writeFileSync(backup, `${JSON.stringify(outline, null, 2)}\n`);
+        fs.writeFileSync(resolved, `${JSON.stringify(working, null, 2)}\n`);
+        result = recheck;
+        repairState = { attempt, auto_degraded: true, degraded, unverified_claims: unverifiedClaims, backup };
+      } else {
+        repairState = { attempt, auto_degraded: false, degrade_skipped: "degraded outline failed validation; original kept", unverified_claims: unverifiedClaims };
+      }
+    }
+  }
   const output = {
+    ...repairState,
     ...result,
     outline: resolved,
     researchHandoff: opts.verifiedResearch ? opts.verifiedResearch.resolved : null,
