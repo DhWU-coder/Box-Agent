@@ -3909,10 +3909,11 @@ async def test_rebound_product_session_can_manage_original_runtime_service(
         assert service.success
         shell = BackgroundShellManager.get(service.bash_id)
         for _ in range(100):
-            if "ready" in shell.output_lines:
+            output = await original_tools["bash_output"].execute(bash_id=service.bash_id)
+            if "ready" in output.stdout:
                 break
             await asyncio.sleep(0.02)
-        assert "ready" in shell.output_lines
+        assert "ready" in output.stdout
 
         if failed_rebind in {"error", "cancelled"}:
             original_finish = assembly.finish_session
@@ -4054,7 +4055,7 @@ async def test_background_service_remains_private_to_its_product_and_adapter(
             result = await tools[name].execute(bash_id=shell.bash_id)
             assert not result.success
             assert "Available: none" in result.error
-        assert shell.last_read_index == 0
+        assert shell.get_new_output() == ["private output"]
         shell.terminate.assert_not_awaited()
     finally:
         await other.aclose()
