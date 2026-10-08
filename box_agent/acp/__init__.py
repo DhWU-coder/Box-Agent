@@ -1602,7 +1602,6 @@ class BoxACPAgent:
         if not self._skills_loaded:
             return None
         try:
-            self._skill_loader.maybe_reload()
             return self._skill_loader.list_skills_metadata(include_connector=False)
         except Exception as exc:
             log.warn("skills/meta_error", message=f"Failed to build skills metadata: {exc}")
@@ -1994,7 +1993,7 @@ class BoxACPAgent:
         tools: list = []
         session_skill_loader = self._skill_loader
         if expert_context is not None and session_skill_loader is not None:
-            session_skill_loader = session_skill_loader.with_expert_skill_sources(
+            session_skill_loader = await session_skill_loader.awith_expert_skill_sources(
                 expert_context.skill_names()
             )
         connector_skill_grants: set[str] = set()
@@ -2068,7 +2067,7 @@ class BoxACPAgent:
                     projection = session_log.replay()
                     restore_loader = (session_skill_loader if session_skill_loader is not None
                                       else AgentService.resolve_skill_loader(self._base_tools))
-                    SkillRuntime(restore_loader, allow_partial_restore=True).restore_records(projection.skills)
+                    await SkillRuntime(restore_loader, allow_partial_restore=True).arestore_records(projection.skills)
                     session_log_restored = bool(projection.messages)
                     session_log.prepare_resume()
                 except BaseException:
@@ -2778,7 +2777,7 @@ class BoxACPAgent:
         # Refresh skills so officev3-authored skills are available mid-session
         if state.skill_loader:
             try:
-                state.skill_loader.maybe_reload()
+                await state.skill_loader.areload()
             except Exception as exc:
                 log.warn("skills/reload_error", session_id=session_id, message=str(exc))
 
@@ -2835,7 +2834,7 @@ class BoxACPAgent:
                 current_system = state.agent.messages[0].content
                 if SKILL_SLOT_SENTINEL in current_system:
                     state.skill_selector.bind(current_system)
-                new_prompt = state.skill_selector.update(skill_selection_text)
+                new_prompt = state.skill_selector.update(skill_selection_text, refresh=False)
                 if new_prompt is not None:
                     self._set_agent_system_prompt(state.agent, new_prompt)
                     log.info(
@@ -2873,7 +2872,7 @@ class BoxACPAgent:
 
         if image_attachment_context:
             user_text = f"{user_text}\n\n{image_attachment_context}"
-        state.agent.add_user_message(user_text)
+        await state.agent.aadd_user_message(user_text)
 
         # Drain any stale injections from a previous turn
         for stale in state.inject_queue.begin_run(discard_pending=True):
@@ -2940,7 +2939,7 @@ class BoxACPAgent:
                     continuation=autopilot.continuations,
                     max_continuations=state.config.agent.goal_autopilot_max_turns,
                 )
-                state.agent.add_user_message(continuation)
+                await state.agent.aadd_user_message(continuation)
                 before_signature = goal_autopilot_progress_signature(state.agent.goal)
                 stop_reason = await self._run_turn(
                     state,

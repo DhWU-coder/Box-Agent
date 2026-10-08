@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -736,7 +737,9 @@ async def _run_agent_loop_impl(
         compact_engine = DefaultCompactEngine()
     context_engine = _services.context_engine
     if context_engine is not None:
-        context_engine.bind_history(messages)
+        binding = getattr(context_engine, "abind_history", context_engine.bind_history)(messages)
+        if inspect.isawaitable(binding):
+            await binding
 
     if artifact_root_dir is not None:
         warning_key = session_id or workspace_dir or "<anonymous>"
@@ -1386,13 +1389,15 @@ async def _run_agent_loop_impl(
         on_response_received = None
         if context_engine is not None:
             output_budget = getattr(llm, "max_output_tokens", 0)
-            projection = context_engine.prepare_request(
+            projection = getattr(context_engine, "aprepare_request", context_engine.prepare_request)(
                 messages, prepared_tools=prepared_tools, token_limit=token_limit,
                 output_tokens=output_budget if isinstance(output_budget, int) else 0,
                 extra_messages=tuple(request_context_messages),
                 transient_message=transient_message,
                 transient_tokens=pending_transient_followup_tokens,
             )
+            if inspect.isawaitable(projection):
+                projection = await projection
             # A blocked projection means the complete request is over budget.
             # Compact at a slightly tighter history limit to leave room for
             # provider-side framing, then always rebind/reproject the live
@@ -1453,13 +1458,15 @@ async def _run_agent_loop_impl(
             if context_compacted:
                 # Rebinding is mandatory: persistent read facts do not prove
                 # the corresponding tool text survived compaction.
-                projection = context_engine.prepare_request(
+                projection = getattr(context_engine, "aprepare_request", context_engine.prepare_request)(
                     messages, prepared_tools=prepared_tools, token_limit=token_limit,
                     output_tokens=output_budget if isinstance(output_budget, int) else 0,
                     extra_messages=tuple(request_context_messages),
                     transient_message=transient_message,
                     transient_tokens=pending_transient_followup_tokens,
                 )
+                if inspect.isawaitable(projection):
+                    projection = await projection
             if projection.blocked_reason:
                 msg = projection.blocked_reason or "Context remains above the safe input limit after bounded compaction."
                 if hook_mgr.hooks:

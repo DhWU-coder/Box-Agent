@@ -580,8 +580,9 @@ class CapabilityResolver:
         skill_access_filter: Callable[[Any], bool] | None = None,
         capability_state: Any = "ready",
         permission_negotiator_available: bool = False,
+        refresh_skills: bool = True,
     ) -> ResolvedCapabilityBundle | CapabilityFailure:
-        skills_or_failure = self._resolve_skills(spec, skill_loader, skill_access_filter)
+        skills_or_failure = self._resolve_skills(spec, skill_loader, skill_access_filter, refresh=refresh_skills)
         if isinstance(skills_or_failure, CapabilityFailure):
             return skills_or_failure
         skills = skills_or_failure
@@ -662,6 +663,7 @@ class CapabilityResolver:
         spec: DelegationSpec,
         skill_loader: Any | None,
         skill_access_filter: Callable[[Any], bool] | None,
+        *, refresh: bool = True,
     ) -> tuple[Any, ...] | CapabilityFailure:
         if not spec.skill_names:
             return ()
@@ -673,7 +675,8 @@ class CapabilityResolver:
             )
 
         try:
-            skill_loader.maybe_reload()
+            if refresh:
+                skill_loader.maybe_reload()
         except Exception as exc:
             return CapabilityFailure(
                 code="SKILL_PROVIDER_UNAVAILABLE",
