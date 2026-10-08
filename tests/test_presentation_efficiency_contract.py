@@ -338,6 +338,68 @@ def test_generated_recovery_keeps_final_coverage_without_restarting_diagnosis():
     assert "3 次 Review" in text and "2 次返修" in text
 
 
+def test_group_relationship_check_can_join_immediate_formal_review_only_when_deck_ready():
+    slide = (STANDARD / "subagents/slide.md").read_text()
+    group = slide.split("7. 全部页面完成逐页像素检查", 1)[1].split("## 4.", 1)[0]
+    assert "同一主 Agent" in group and "全册" in group
+    assert "立即进入正式 Review" in group and "尚未执行的组末关系检查" in group
+    assert "其他环境及已有编辑" in group and "未全册就绪" in group
+    review = (STANDARD / "subagents/review.md").read_text()
+    diagnosis = review.split("### A.", 1)[1].split("### B.", 1)[0]
+    assert "承接尚未执行的组末关系检查" in diagnosis
+    assert all(term in diagnosis for term in ("各组", "亲缘", "节奏", "重复", "漂移"))
+    root = (STANDARD / "SKILL.md").read_text()
+    production = root.split("### 阶段 4：", 1)[1].split("### 阶段 5：", 1)[0]
+    assert "组末关系检查并入正式 Review" in production
+    assert "封面、每张章节页、结尾及全部内容页" in production
+
+
+def test_formal_copy_repairs_go_directly_to_review_prep_after_plan_sync():
+    review = (STANDARD / "subagents/review.md").read_text()
+    repair = review.split("### B.", 1)[1].split("## 5.", 1)[0]
+    step = next(line for line in repair.splitlines() if line.startswith("2. "))
+    assert "Box-Agent 静态新建" in step and "不单独运行 `deck.py prepare`" in step
+    assert "其他环境及已有编辑" in step and "再运行 `deck.py prepare`" in step
+    root = (STANDARD / "SKILL.md").read_text()
+    freeze = next(line for line in root.splitlines() if line.startswith("规划冻结条件："))
+    assert "正式 Review" in freeze and "review-prep" in freeze
+    assert "首张 HTML" in freeze and "再重跑 `deck.py prepare`" in freeze
+
+
+def test_image_candidates_have_parent_handoff_without_claiming_asset_readiness():
+    image = (STANDARD / "subagents/image.md").read_text()
+    returned = image.split("## 6. 返回合同", 1)[1]
+    status = re.search(r"(?m)^status: (.+)$", returned).group(1).split(" | ")
+    assert status == ["ready", "blocked", "pending_parent_verification"]
+    assert "prompt:" in returned and "pending_parent_operations:" in returned
+    assert "否则返回 `blocked`" not in returned
+    tools = (STANDARD / "references/box-agent-tool-contract.md").read_text()
+    handoff = tools.split("### 子任务输入与返回", 1)[1].split("## 4.", 1)[0]
+    assert "Image" in handoff and "pending_parent_verification" in handoff
+    assert "不要求重新委派" in handoff and "真实候选路径" in handoff
+    root = (STANDARD / "SKILL.md").read_text()
+    production = root.split("### 阶段 4：", 1)[1].split("### 阶段 5：", 1)[0]
+    assert "接收 `pending_parent_verification`" in production
+    assert "不要求 Image 再返回一份 ready 合同" in production
+    assert "catalog 中所有计划 `asset_id` 都必须为 `ready`" in production
+
+
+def test_visual_service_failure_preserves_existing_artifacts_without_starting_export():
+    repo = Path(__file__).resolve().parents[1]
+    sync = runpy.run_path(str(repo / "scripts/sync_presentation_suite.py"))
+    relative = "skills/sn-ppt-standard/references/box-agent-tool-contract.md"
+    data = (STANDARD / "references/box-agent-tool-contract.md").read_bytes()
+    if "PRESENTATION_STANDARD_SOURCE" in os.environ:
+        data = sync["_apply_integration_overlay"](relative, data)
+        data = sync["_image_inspection_recovery_overlay"](relative, data)
+    recovery = data.decode().split("视觉降级的判定顺序", 1)[1].split("\n- 检查范围", 1)[0]
+    assert "仅对实际已存在的 PPTX" in recovery
+    assert "不启动新的 PPTX 导出" in recovery
+    assert all(term in recovery for term in ("visual_unverified", "partial", "未检查页", "错误"))
+    assert "final_pixels_inspected: yes" in recovery and "--force" in recovery
+    assert "交付可用 HTML/PPTX" not in recovery
+
+
 @pytest.mark.parametrize("missing", [False, True])
 @pytest.mark.parametrize("model", ["actual-model-from-tool", None])
 def test_documented_asset_batch_preserves_source_and_stops_on_failure(tmp_path, missing, model):
