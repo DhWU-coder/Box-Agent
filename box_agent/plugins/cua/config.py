@@ -12,6 +12,7 @@ class CuaConfig(BaseModel):
 
     server_name: str = Field(default="computer-use", min_length=1)
     feed_screenshots: bool = True
+    persist_images: bool = True
 
 
 __all__ = ["CuaConfig"]

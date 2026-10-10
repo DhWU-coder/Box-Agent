@@ -1,6 +1,7 @@
 """MCP tool loader with real MCP client integration and timeout handling."""
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -79,6 +80,7 @@ from .mcp_sources import (
 from .model_tool_context import current_model_tool_context
 from .mcp_result_hooks import (
     adapt_mcp_inline_images,
+    adapt_mcp_result_context,
     allowed_mcp_result_adapters,
     persist_mcp_image_references,
 )
@@ -1154,10 +1156,56 @@ class MCPTool(Tool):
                     content_parts.append(str(item))
 
             content_str = "\n".join(content_parts)
-
             is_error = result.isError if hasattr(result, "isError") else False
-
             structured_error = _structured_mcp_error_message(content_str)
+            structured_content = getattr(result, "structuredContent", None)
+            if not isinstance(structured_content, dict):
+                structured_content = None
+            if structured_content is not None:
+                structured_error = structured_error or _structured_mcp_error_message(
+                    json.dumps(structured_content, ensure_ascii=False),
+                )
+            context = adapt_mcp_result_context(
+                server_name=self._server_name, remote_name=self._remote_name,
+                arguments=call_arguments, structured_content=structured_content,
+            )
+            if context:
+                content_str = "\n".join([content_str, context]).strip()
+            result_adapters = (
+                allowed_mcp_result_adapters(
+                    server_name=self._server_name, remote_name=self._remote_name,
+                ) if inline_images else ()
+            )
+            image_references = persist_mcp_image_references(
+                server_name=self._server_name, remote_name=self._remote_name,
+                inline_images=inline_images, adapters=result_adapters,
+            )
+            raw_output: dict[str, Any] = {}
+            if structured_content is not None:
+                raw_output["mcp_structured_content"] = structured_content
+            if image_references:
+                raw_output["mcp_image_references"] = image_references
+                paths = [
+                    str(block["contentRef"]) for block in image_references
+                    if isinstance(block, dict) and isinstance(block.get("contentRef"), str)
+                ]
+                content_str = "\n".join([content_str, *paths]).strip()
+            # Persisted references replace only bytes demonstrably covered by
+            # the sidecar. Other images retain the existing raw-output path.
+            persisted_hashes = {
+                block.get("sha256") for block in image_references or []
+                if isinstance(block, dict) and isinstance(block.get("contentRef"), str)
+            }
+            unsaved_images = []
+            for image in inline_images:
+                try:
+                    digest = hashlib.sha256(base64.b64decode(image["data"], validate=True)).hexdigest()
+                except (ValueError, TypeError):
+                    digest = None
+                if digest is None or digest not in persisted_hashes:
+                    unsaved_images.append(image)
+            if unsaved_images:
+                raw_output["mcp_inline_images"] = unsaved_images
             if is_error or structured_error:
                 release_browser_runtime_after_call = self._server_name == "playwright"
                 public_content = public_browser_tool_text(
@@ -1172,51 +1220,25 @@ class MCPTool(Tool):
                     success=False,
                     content=public_content,
                     error=err_msg,
+                    raw_output=raw_output or None,
                 )
             release_browser_runtime_after_call = (
                 self._server_name == "playwright"
                 and self._remote_name == "browser_snapshot"
             )
-            # Optional run-scoped result adapters may expose selected binary
-            # content through the shared ToolResult adaptation channels.
-            # ``raw_output`` remains the original MCP payload.
-            result_adapters = (
-                allowed_mcp_result_adapters(
-                    server_name=self._server_name,
-                    remote_name=self._remote_name,
-                )
-                if inline_images
-                else ()
-            )
-            image_references = persist_mcp_image_references(
-                server_name=self._server_name,
-                remote_name=self._remote_name,
-                inline_images=inline_images,
-                adapters=result_adapters,
-            )
-            if image_references:
-                paths = [
-                    str(block["contentRef"])
-                    for block in image_references
-                    if isinstance(block, dict) and isinstance(block.get("contentRef"), str)
-                ]
-                if paths:
-                    content_str = "\n".join([content_str, *paths]).strip()
             transient_followup_content = adapt_mcp_inline_images(
                 server_name=self._server_name,
                 remote_name=self._remote_name,
                 inline_images=inline_images,
                 adapters=result_adapters,
+                arguments=call_arguments,
+                structured_content=structured_content,
             )
             return ToolResult(
                 success=True,
                 content=content_str,
                 error=None,
-                raw_output=(
-                    {"mcp_inline_images": inline_images}
-                    if inline_images
-                    else None
-                ),
+                raw_output=raw_output or None,
                 transient_followup_content=transient_followup_content or None,
             )
 
