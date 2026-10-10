@@ -170,6 +170,7 @@ from box_agent.skill_runtime import SkillRuntime
 from box_agent.turn_runtime import sync_skill_cache_fingerprint_context
 from box_agent.client_info import ClientInfo, scoped_client_info
 from box_agent.llm import LLMClient, SessionBoundLLM
+from box_agent.llm.base import closing_llm_stream
 from box_agent.llm.model_routing import normalize_auto_routing, resolve_model_client
 from box_agent.llm.model_profiles import client_for_model_profile
 from box_agent.llm.token_meter import get_token_meter, reset_token_meter, start_token_meter
@@ -344,22 +345,23 @@ class _ActionHintNormalizingLLM:
     async def generate_stream(self, *args: Any, **kwargs: Any):
         normalizer = ActionHintStreamNormalizer()
         text_template = None
-        async for event in self._wrapped.generate_stream(*args, **kwargs):
-            event_type = getattr(event, "type", None)
-            if event_type == "finish":
-                for text in normalizer.finish():
-                    if text:
-                        yield _text_stream_event_like(event, text)
-                yield event
-                continue
-            if event_type != "text":
-                yield event
-                continue
+        async with closing_llm_stream(self._wrapped.generate_stream(*args, **kwargs)) as stream:
+            async for event in stream:
+                event_type = getattr(event, "type", None)
+                if event_type == "finish":
+                    for text in normalizer.finish():
+                        if text:
+                            yield _text_stream_event_like(event, text)
+                    yield event
+                    continue
+                if event_type != "text":
+                    yield event
+                    continue
 
-            text_template = event
-            for text in normalizer.push(event.delta or ""):
-                if text:
-                    yield event.model_copy(update={"delta": text})
+                text_template = event
+                for text in normalizer.push(event.delta or ""):
+                    if text:
+                        yield event.model_copy(update={"delta": text})
 
         if text_template is not None:
             for text in normalizer.finish():
@@ -392,22 +394,23 @@ class _FollowUpSuggestionsExtractingLLM:
         extractor = FollowUpSuggestionsStreamExtractor()
         self._extractor = extractor
         text_template = None
-        async for event in self._wrapped.generate_stream(*args, **kwargs):
-            event_type = getattr(event, "type", None)
-            if event_type == "finish":
-                for text in extractor.finish():
-                    if text:
-                        yield _text_stream_event_like(event, text)
-                yield event
-                continue
-            if event_type != "text":
-                yield event
-                continue
+        async with closing_llm_stream(self._wrapped.generate_stream(*args, **kwargs)) as stream:
+            async for event in stream:
+                event_type = getattr(event, "type", None)
+                if event_type == "finish":
+                    for text in extractor.finish():
+                        if text:
+                            yield _text_stream_event_like(event, text)
+                    yield event
+                    continue
+                if event_type != "text":
+                    yield event
+                    continue
 
-            text_template = event
-            for text in extractor.push(event.delta or ""):
-                if text:
-                    yield event.model_copy(update={"delta": text})
+                text_template = event
+                for text in extractor.push(event.delta or ""):
+                    if text:
+                        yield event.model_copy(update={"delta": text})
 
         if text_template is not None:
             for text in extractor.finish():
