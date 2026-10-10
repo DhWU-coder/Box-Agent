@@ -405,6 +405,13 @@ In non-interactive `--task` mode and ACP sessions, active goals also use bounded
 
 ## ACP & Editor Integration
 
+ACP `session/cancel` interrupts a pending primary model stream read without
+waiting for the next HTTP chunk or activity heartbeat, then closes the stream
+and finishes the turn with `stopReason: cancelled`. This does not restart the
+shared runtime or cancel other sessions. Tool execution retains its existing
+cooperative cancellation behavior; cancelling a turn does not roll back tool
+side effects that have already occurred.
+
 Box Agent supports the [Agent Communication Protocol](https://github.com/nichochar/agent-client-protocol) for embedding in editors and apps.
 
 **Zed Editor** — add to `settings.json`:

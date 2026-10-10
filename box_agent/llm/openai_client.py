@@ -1272,9 +1272,6 @@ class OpenAIClient(LLMClientBase):
                                     finish_reason = "tool_argument_limit"
                                     break
                         if oversized_info:
-                            closer = getattr(response_stream, "aclose", None)
-                            if closer is not None:
-                                await closer()
                             break
             except Exception as exc:
                 log_llm_error_meta(provider="openai", mode="stream", exc=exc)
@@ -1311,6 +1308,19 @@ class OpenAIClient(LLMClientBase):
             else:
                 # Successful consume — break out of the retry loop.
                 break
+            finally:
+                # The SDK stream is not a context manager here. Cancellation
+                # while awaiting a chunk must also release its HTTP response.
+                closer = getattr(response_stream, "close", None) or getattr(
+                    response_stream, "aclose", None
+                )
+                if closer is not None:
+                    try:
+                        await _await_if_needed(closer())
+                    except Exception as exc:
+                        # Cleanup must not replace cancellation, the provider's
+                        # original error, or its normal completion/retry path.
+                        logger.warning("OpenAI stream cleanup failed (%s)", type(exc).__name__)
 
         if oversized_info:
             logger.warning(
