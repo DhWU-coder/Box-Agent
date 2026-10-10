@@ -106,3 +106,60 @@ async def test_cancelling_pending_read_awaits_provider_cleanup(cleanup_error):
         await asyncio.wait_for(consumer, 2)
     await stream.aclose()
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_error", [False, True])
+async def test_provider_completion_cleans_up_cancellation_waiter(provider_error):
+    waiter_closed = asyncio.Event()
+
+    async def wait_cancelled():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            waiter_closed.set()
+
+    async def provider():
+        if provider_error:
+            raise ValueError("fixture provider failure")
+        yield StreamEvent(type="text", delta="ready")
+
+    stream = stream_controller.stream_with_activity(
+        provider(), stale_seconds=60, activity_interval_seconds=15,
+        wait_cancelled=wait_cancelled,
+    )
+    if provider_error:
+        with pytest.raises(ValueError, match="fixture provider failure"):
+            await anext(stream)
+    else:
+        assert [event.delta async for event in stream] == ["ready"]
+    assert waiter_closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["exhausted", "provider_error", "chunk"])
+async def test_control_cancel_wins_when_provider_read_also_finishes(monkeypatch, outcome):
+    cancelled, closed = asyncio.Event(), asyncio.Event()
+    real_wait = asyncio.wait
+
+    async def provider():
+        try:
+            if outcome == "provider_error":
+                raise ValueError("fixture provider failure")
+            if outcome == "chunk":
+                yield StreamEvent(type="text", delta="must not be delivered")
+        finally:
+            closed.set()
+
+    async def complete_both(tasks, **kwargs):
+        await real_wait(tasks, **kwargs)
+        cancelled.set()
+        return await real_wait(tasks)
+
+    monkeypatch.setattr(stream_controller.asyncio, "wait", complete_both)
+    stream = stream_controller.stream_with_activity(
+        provider(), stale_seconds=60, activity_interval_seconds=15,
+        wait_cancelled=cancelled.wait,
+    )
+    assert [event async for event in stream] == []
+    assert closed.is_set()

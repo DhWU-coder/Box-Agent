@@ -7,10 +7,11 @@ reimplementation was missing.
 
 PoC Behavior Boundaries
 -----------------------
-**Cancellation**: Cooperative — ``cancel()`` sets a flag that the core
-checks at step boundaries (top of step, before tools, after each tool).
-There is no preemptive kill; a long-running LLM call or tool execution
-will finish before cancellation is observed.
+**Cancellation**: ``cancel()`` signals the current run. A pending primary
+model stream read is interrupted without waiting for another HTTP chunk or
+heartbeat; stream cleanup completes before the cancelled turn response.
+Tool execution still uses its existing cooperative cancellation boundaries.
+The shared runtime and unrelated sessions are not killed.
 
 **Safety confirmation**: protocol-aware. Dangerous commands return a
 canonical permission request with ``scope="safety"``. The shared core

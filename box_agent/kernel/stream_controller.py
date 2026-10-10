@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from time import perf_counter
 
 from ..schema import StreamEvent
@@ -76,17 +76,28 @@ async def stream_with_activity(
     *,
     stale_seconds: float,
     activity_interval_seconds: float,
+    wait_cancelled: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[StreamEvent]:
-    """Add bounded host heartbeats and stop a provider stream that is stale."""
+    """Wake on cancellation as well as provider data, heartbeats, and staleness."""
     iterator = stream.__aiter__()
     next_chunk: asyncio.Task[StreamEvent] | None = None
+    cancel_wait: asyncio.Future[None] | None = None
     last_provider_chunk = perf_counter()
     try:
+        if wait_cancelled is not None:
+            cancel_wait = asyncio.ensure_future(wait_cancelled())
         next_chunk = asyncio.create_task(iterator.__anext__())
         while True:
+            waiters: set[asyncio.Future] = {next_chunk}
+            if cancel_wait is not None:
+                waiters.add(cancel_wait)
             done, _ = await asyncio.wait(
-                {next_chunk}, timeout=activity_interval_seconds
+                waiters, timeout=activity_interval_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if cancel_wait is not None and cancel_wait in done:
+                cancel_wait.result()
+                return
             if not done:
                 stale_seconds_elapsed = perf_counter() - last_provider_chunk
                 if stale_seconds_elapsed >= stale_seconds:
@@ -117,6 +128,9 @@ async def stream_with_activity(
             yield chunk
             next_chunk = asyncio.create_task(iterator.__anext__())
     finally:
+        if cancel_wait is not None:
+            cancel_wait.cancel()
+            await asyncio.gather(cancel_wait, return_exceptions=True)
         if next_chunk is not None and not next_chunk.done():
             next_chunk.cancel()
             try:
