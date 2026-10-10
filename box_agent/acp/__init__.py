@@ -5675,9 +5675,9 @@ async def run_acp_server(config: Config | None = None) -> None:
         )
         prompt_path = Config.find_config_file(config.agent.system_prompt_path)
         if prompt_path and prompt_path.exists():
-            system_prompt = render_system_prompt_template(
-                prompt_path.read_text(encoding="utf-8")
-            )
+            # Keep {{.CurrentDate}} unrendered: build_acp_session_prompt renders
+            # it per session, so a server that outlives midnight stays correct.
+            system_prompt = prompt_path.read_text(encoding="utf-8")
         else:
             system_prompt = "You are a helpful AI assistant."
 

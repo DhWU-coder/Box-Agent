@@ -1397,6 +1397,7 @@ Do NOT use Get-Content/type to read files; use read_file instead.
 For routine file discovery and content search, use glob/grep when available or search_files. Use bash rg only for specialized operations those tools do not express, such as exact match counts.
 For a one-level directory view, use a read-only non-recursive command such as Get-ChildItem -Name. Do not use PowerShell for recursive file discovery or content search.
 Reserve bash for that directory view, git, builds, tests, package managers, processes, scripts, and system commands.
+Git: read-only commands (status, diff, log, show) are fine. Do not commit, push, amend, rebase, stash, reset --hard, clean, checkout/restore over uncommitted changes, use --force/--no-verify, or change git config unless the user explicitly asks; the working tree may contain the user's own uncommitted work.
 
 Parameters:
   - command (required): PowerShell command to execute
@@ -1406,7 +1407,7 @@ Parameters:
 
 Tips:
   - Quote file paths with spaces: cd "My Documents"
-  - Chain dependent commands with semicolon: git add . ; git commit -m "msg"
+  - Chain dependent commands with semicolon: npm install ; npm test
   - Use absolute paths instead of cd when possible
   - For background commands, monitor with bash_output and terminate with bash_kill
   - Use lifetime=runtime only when the user explicitly needs a service or command to remain available after the final response
@@ -1421,6 +1422,7 @@ Do NOT use cat/head/tail to read files; use read_file instead.
 For routine file discovery and content search, use glob/grep when available or search_files. Use bash rg only for specialized operations those tools do not express, such as exact match counts.
 For a one-level directory view, use a read-only non-recursive command such as find . -mindepth 1 -maxdepth 1 -print. Do not use Bash for recursive file discovery or content search.
 Reserve bash for that directory view, git, builds, tests, package managers, processes, scripts, and system commands.
+Git: read-only commands (status, diff, log, show) are fine. Do not commit, push, amend, rebase, stash, reset --hard, clean, checkout/restore over uncommitted changes, use --force/--no-verify, or change git config unless the user explicitly asks; the working tree may contain the user's own uncommitted work.
 
 Parameters:
   - command (required): Bash command to execute
@@ -1430,7 +1432,7 @@ Parameters:
 
 Tips:
   - Quote file paths with spaces: cd "My Documents"
-  - Chain dependent commands with &&: git add . && git commit -m "msg"
+  - Chain dependent commands with &&: npm install && npm test
   - Use absolute paths instead of cd when possible
   - Put disposable intermediate files under "$BOX_AGENT_SCRATCH_DIR"; the session cleans this reserved directory safely, so do not remove it with rm
   - Keep retained QA reports, requested previews, and delivery dependencies in the task directory. Do not recursively delete QA/task directories as delivery housekeeping; leave undeclared files in place.
