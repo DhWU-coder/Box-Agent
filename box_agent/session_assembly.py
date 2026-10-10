@@ -24,7 +24,10 @@ from .tools.permissions import CapabilityPolicy
 from .tools.runtime import (
     SkillRuntimeContext, build_skill_runtime_context, build_skill_runtime_prompt,
 )
-from .tools.setup import build_sandbox_info_prompt, build_file_delivery_prompt, render_system_prompt_template
+from .tools.setup import (
+    build_file_delivery_prompt, build_image_generation_prompt, build_sandbox_info_prompt,
+    render_system_prompt_template,
+)
 from .project_context import (
     PROJECT_WORKSPACE_MODE_PROMPT, append_prompt_segment, compose_prompt_segments,
     build_project_startup_context_prompt,
@@ -282,42 +285,18 @@ async def prepare_tools(resources: SessionResources) -> None:
 
 
 async def prepare_prompt(resources: SessionResources) -> None:
+    """Load the profile's template, then compose it with the shared builder.
+
+    Adapters only differ in where the template comes from and in host-provided
+    inputs (policy, layout, expert, suffix, UI hints); composition and order
+    are owned by ``build_session_prompt`` for CLI, ACP and the Python SDK.
+    """
     context = resources.context
     host, options, config = context.host, context.options, context.config
     if _prepared(resources):
         resources.system_prompt = host.system_prompt
         return
     from .config import Config
-    from .project_context import append_prompt_segment, compose_prompt_segments
-    from .tools.setup import (build_file_delivery_prompt, build_image_generation_prompt,
-                              build_sandbox_info_prompt, render_system_prompt_template)
-    from .tools.runtime import build_skill_runtime_prompt
-
-    if options.profile == "acp":
-        prompt = build_acp_session_prompt(
-            config, host.system_prompt or "You are a helpful AI assistant.",
-            resources.memory_manager, options.session_mode,
-            workspace=context.workspace, policy=options.effective_policy,
-            env_context=resources.state.get("env_context"),
-            skill_runtime_context=resources.state.get("skill_runtime_context"),
-            expert_context=resources.state.get("expert_context"),
-            workspace_layout=options.workspace_layout,
-            enable_general_directory_policy=(
-                not options.utility and options.session_mode in {None, "general"}
-            ),
-            follow_up_suggestions_enabled=options.follow_up_suggestions_enabled,
-        )
-        if resources.memory_manager is not None and not options.utility:
-            memory = await asyncio.to_thread(resources.memory_manager.recall)
-            resources.state["memory_block"] = memory or None
-            if memory:
-                prompt = append_prompt_segment(prompt, memory)
-        if not options.utility:
-            prompt = f"{prompt.rstrip()}\n\n{build_image_generation_prompt(config)}"
-        if host.prompt_suffix:
-            prompt = f"{prompt.rstrip()}\n\n{host.prompt_suffix.strip()}"
-        resources.system_prompt = prompt
-        return
 
     def status(message: str, *, success: bool = True) -> None:
         if options.profile == "cli" and host.output is not None:
@@ -325,52 +304,47 @@ async def prepare_prompt(resources: SessionResources) -> None:
             color = Colors.GREEN if success else Colors.YELLOW
             host.output(f"{color}{message}{Colors.RESET}")
 
-    prompt = host.system_prompt
-    if prompt is None:
+    template = host.system_prompt
+    if template is None and options.profile == "acp":
+        template = "You are a helpful AI assistant."
+    elif template is None:
         path = Config.find_config_file(config.agent.system_prompt_path)
-        prompt = (render_system_prompt_template(path.read_text(encoding="utf-8"))
-                  if path and path.exists() else
-                  "You are Box-Agent, an intelligent assistant that can help users complete various tasks.")
         if path and path.exists():
+            template = path.read_text(encoding="utf-8")
             status(f"✅ Loaded system prompt (from: {path})")
         else:
+            template = "You are Box-Agent, an intelligent assistant that can help users complete various tasks."
             status("⚠️  System prompt not found, using default", success=False)
-    if resources.skill_loader is not None:
-        from .tools.skill_loader import SKILL_SLOT_SENTINEL
-
-        prompt = prompt.replace("{SKILLS_METADATA}", SKILL_SLOT_SENTINEL)
-    else:
-        prompt = prompt.replace("{SKILLS_METADATA}", "")
-    prompt = compose_prompt_segments(prompt, replacements={
-        "{SANDBOX_INFO}": build_sandbox_info_prompt() if options.sandbox_mode else "",
-        "{FILE_DELIVERY_INFO}": build_file_delivery_prompt(),
-    })
     if options.profile == "cli" and options.session_mode == "code_agent":
-        prompt = compose_prompt_segments(prompt, segments=(
-            PROJECT_WORKSPACE_MODE_PROMPT,
-            build_project_startup_context_prompt(context.workspace),
-        ))
         code_path = Config.find_config_file(config.agent.code_prompt_path)
         if code_path and code_path.exists():
-            code_prompt = code_path.read_text(encoding="utf-8").strip()
-            prompt = append_prompt_segment(prompt, code_prompt)
-            if code_prompt:
-                status(f"✅ Loaded code workspace prompt (from: {code_path})")
+            status(f"✅ Loaded code workspace prompt (from: {code_path})")
         else:
             status("⚠️  Code workspace prompt not found", success=False)
-    if not options.utility:
-        prompt = append_prompt_segment(prompt, build_image_generation_prompt(config))
-    runtime_context = resources.state.get("skill_runtime_context")
-    if runtime_context is not None:
-        prompt = append_prompt_segment(prompt, build_skill_runtime_prompt(runtime_context))
-    if options.profile == "cli":
-        prompt = append_prompt_segment(prompt, build_env_context_prompt(resources.state.get("env_context")))
+
+    memory_block = None
     if resources.memory_manager is not None and not options.utility:
-        memory = await asyncio.to_thread(resources.memory_manager.recall)
-        resources.state["memory_block"] = memory
-        if memory:
-            prompt = append_prompt_segment(prompt, memory)
-    resources.system_prompt = prompt
+        memory_block = await asyncio.to_thread(resources.memory_manager.recall) or None
+        resources.state["memory_block"] = memory_block
+
+    resources.system_prompt = build_session_prompt(
+        config, template,
+        session_mode=options.session_mode,
+        workspace=context.workspace,
+        utility=options.utility,
+        sandbox_mode=options.sandbox_mode,
+        skills_slot=resources.skill_loader is not None,
+        policy=options.effective_policy,
+        env_context=resources.state.get("env_context"),
+        skill_runtime_context=resources.state.get("skill_runtime_context"),
+        expert_context=resources.state.get("expert_context"),
+        workspace_layout=options.workspace_layout,
+        follow_up_suggestions_enabled=options.follow_up_suggestions_enabled,
+        host_ui_hints=options.profile == "acp",
+        memory=resources.memory_manager,
+        memory_block=memory_block,
+        prompt_suffix=host.prompt_suffix,
+    )
 
 
 async def prepare_hooks(resources: SessionResources) -> None:
@@ -562,28 +536,39 @@ def _build_action_hints_prompt(config, memory, env_context: EnvContext | None = 
     )
 
 
-def build_acp_session_prompt(
-    config, system_prompt, memory,
-    session_mode: str | None,
-    workspace: Path | None = None,
-    policy: CapabilityPolicy | None = None,
-    env_context: EnvContext | None = None,
-    skill_runtime_context: SkillRuntimeContext | None = None,
-    expert_context: ExpertSessionContext | None = None,
-    workspace_layout: Any = None,
-    enable_general_directory_policy: bool = False,
-    follow_up_suggestions_enabled: bool = False,
-) -> str:
-    """Build system prompt with conditional mode-specific injection."""
-    _MODE_PROMPT_MAP = {
-        "data_analysis": "analysis_prompt_path",
-        "code_agent": "code_prompt_path",
-    }
+_MODE_PROMPT_MAP = {
+    "data_analysis": "analysis_prompt_path",
+    "code_agent": "code_prompt_path",
+}
 
+
+def _compose_session_prompt(
+    config, template: str, memory,
+    session_mode: str | None,
+    *,
+    workspace: Path | None,
+    sandbox_mode: bool,
+    skills_slot: bool,
+    policy: CapabilityPolicy | None,
+    env_context: EnvContext | None,
+    skill_runtime_context: SkillRuntimeContext | None,
+    expert_context: ExpertSessionContext | None,
+    workspace_layout: Any,
+    enable_general_directory_policy: bool,
+    follow_up_suggestions_enabled: bool,
+    host_ui_hints: bool,
+) -> str:
+    """Template plus the ordered session overlays shared by every adapter."""
+    if skills_slot:
+        from .tools.skill_loader import SKILL_SLOT_SENTINEL
+
+        template = template.replace("{SKILLS_METADATA}", SKILL_SLOT_SENTINEL)
+    else:
+        template = template.replace("{SKILLS_METADATA}", "")
     base_prompt = compose_prompt_segments(
-        render_system_prompt_template(system_prompt),
+        render_system_prompt_template(template),
         replacements={
-            "{SANDBOX_INFO}": build_sandbox_info_prompt(),
+            "{SANDBOX_INFO}": build_sandbox_info_prompt() if sandbox_mode else "",
             "{FILE_DELIVERY_INFO}": build_file_delivery_prompt(),
         },
         segments=(
@@ -619,7 +604,7 @@ def build_acp_session_prompt(
         base_prompt = append_prompt_segment(base_prompt, env_prompt)
 
     runtime_context = skill_runtime_context or build_skill_runtime_context(
-        sandbox_mode=True,
+        sandbox_mode=sandbox_mode,
         env_context=env_context,
     )
     base_prompt = append_prompt_segment(
@@ -627,9 +612,12 @@ def build_acp_session_prompt(
         build_skill_runtime_prompt(runtime_context),
     )
 
-    hints_prompt = _build_action_hints_prompt(config, memory, env_context)
-    if hints_prompt:
-        base_prompt = append_prompt_segment(base_prompt, hints_prompt)
+    # Action hints steer the user to host settings UI (e.g. officev3 tabs);
+    # only hosts that render ``action_hint`` blocks opt in.
+    if host_ui_hints:
+        hints_prompt = _build_action_hints_prompt(config, memory, env_context)
+        if hints_prompt:
+            base_prompt = append_prompt_segment(base_prompt, hints_prompt)
 
     if follow_up_suggestions_enabled:
         base_prompt = append_prompt_segment(
@@ -649,14 +637,86 @@ def build_acp_session_prompt(
                     mode_prompt,
                     skip_empty=False,
                 )
-            else:
-                pass  # Missing optional mode prompt.
 
     if expert_context:
         expert_prompt = expert_context.render_prompt()
         if expert_prompt:
             base_prompt = append_prompt_segment(base_prompt, expert_prompt)
     return base_prompt
+
+
+def build_session_prompt(
+    config, template: str,
+    *,
+    session_mode: str | None,
+    workspace: Path | None,
+    utility: bool = False,
+    sandbox_mode: bool = True,
+    skills_slot: bool = False,
+    policy: CapabilityPolicy | None = None,
+    env_context: EnvContext | None = None,
+    skill_runtime_context: SkillRuntimeContext | None = None,
+    expert_context: ExpertSessionContext | None = None,
+    workspace_layout: Any = None,
+    follow_up_suggestions_enabled: bool = False,
+    host_ui_hints: bool = False,
+    memory=None,
+    memory_block: str | None = None,
+    prompt_suffix: str | None = None,
+) -> str:
+    """The one system-prompt builder for CLI, ACP and Python SDK sessions."""
+    prompt = _compose_session_prompt(
+        config, template, memory, session_mode,
+        workspace=workspace,
+        sandbox_mode=sandbox_mode,
+        skills_slot=skills_slot,
+        policy=policy,
+        env_context=env_context,
+        skill_runtime_context=skill_runtime_context,
+        expert_context=expert_context,
+        workspace_layout=workspace_layout,
+        enable_general_directory_policy=(
+            not utility and session_mode in {None, "general"}
+        ),
+        follow_up_suggestions_enabled=follow_up_suggestions_enabled,
+        host_ui_hints=host_ui_hints,
+    )
+    if memory_block and not utility:
+        prompt = append_prompt_segment(prompt, memory_block)
+    if not utility:
+        prompt = append_prompt_segment(prompt, build_image_generation_prompt(config))
+    if prompt_suffix and prompt_suffix.strip():
+        prompt = append_prompt_segment(prompt, prompt_suffix.strip())
+    return prompt
+
+
+def build_acp_session_prompt(
+    config, system_prompt, memory,
+    session_mode: str | None,
+    workspace: Path | None = None,
+    policy: CapabilityPolicy | None = None,
+    env_context: EnvContext | None = None,
+    skill_runtime_context: SkillRuntimeContext | None = None,
+    expert_context: ExpertSessionContext | None = None,
+    workspace_layout: Any = None,
+    enable_general_directory_policy: bool = False,
+    follow_up_suggestions_enabled: bool = False,
+) -> str:
+    """Compatibility view: the ACP overlays without memory/image/suffix tails."""
+    return _compose_session_prompt(
+        config, system_prompt, memory, session_mode,
+        workspace=workspace,
+        sandbox_mode=True,
+        skills_slot=False,
+        policy=policy,
+        env_context=env_context,
+        skill_runtime_context=skill_runtime_context,
+        expert_context=expert_context,
+        workspace_layout=workspace_layout,
+        enable_general_directory_policy=enable_general_directory_policy,
+        follow_up_suggestions_enabled=follow_up_suggestions_enabled,
+        host_ui_hints=True,
+    )
 
 
 def create_application_runtime():
