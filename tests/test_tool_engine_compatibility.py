@@ -323,6 +323,17 @@ def _assert_schema_contract(tools, profile):
                 anchor,
                 anchor + '  - For temporary script outputs elsewhere, declare temporary_files before creation. Paths must be new and parent directories must exist. Clean unchanged, unpublished files with exact rm targets in a separate command, optionally `cd ... && rm ... && ls`.\n',
             )
+            # Git safety: no unrequested-commit example, explicit read-only git guidance.
+            git_anchor = "Reserve bash for that directory view, git, builds, tests, package managers, processes, scripts, and system commands.\n"
+            description = entry["schema"]["description"]
+            assert description.count(git_anchor) == 1
+            entry["schema"]["description"] = description.replace(
+                git_anchor,
+                git_anchor + "Git: read-only commands (status, diff, log, show) are fine. Do not commit, push, amend, rebase, stash, reset --hard, clean, checkout/restore over uncommitted changes, use --force/--no-verify, or change git config unless the user explicitly asks; the working tree may contain the user's own uncommitted work.\n",
+            ).replace(
+                '  - Chain dependent commands with &&: git add . && git commit -m "msg"\n',
+                "  - Chain dependent commands with &&: npm install && npm test\n",
+            )
             entry["schema"]["input_schema"]["properties"]["temporary_files"] = {
                 "type": "array", "items": {"type": "string"}, "maxItems": 64,
                 "description": "New disposable output files this foreground command will create, relative to the workspace (not inline cd). Parents must exist. Runtime reserves absent paths; existing files cannot be adopted. Write reserved files in place. Later exact rm is approval-free only while unchanged and unpublished.",

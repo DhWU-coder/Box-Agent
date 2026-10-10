@@ -24,7 +24,7 @@ from .tools.permissions import CapabilityPolicy
 from .tools.runtime import (
     SkillRuntimeContext, build_skill_runtime_context, build_skill_runtime_prompt,
 )
-from .tools.setup import build_sandbox_info_prompt, build_file_delivery_prompt
+from .tools.setup import build_sandbox_info_prompt, build_file_delivery_prompt, render_system_prompt_template
 from .project_context import (
     PROJECT_WORKSPACE_MODE_PROMPT, append_prompt_segment, compose_prompt_segments,
     build_project_startup_context_prompt,
@@ -581,7 +581,7 @@ def build_acp_session_prompt(
     }
 
     base_prompt = compose_prompt_segments(
-        system_prompt,
+        render_system_prompt_template(system_prompt),
         replacements={
             "{SANDBOX_INFO}": build_sandbox_info_prompt(),
             "{FILE_DELIVERY_INFO}": build_file_delivery_prompt(),
